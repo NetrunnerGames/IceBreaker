@@ -22,7 +22,7 @@ A lightweight, native single-DLL Steam hook for automated Lua plugin & manifest 
 ## Key Features
 
 - **Single-DLL Footprint**: Operates as a single proxy DLL (`version.dll`) placed directly in the Steam root directory.
-- **Dynamic Lua Manifest Reloading**: Automatically scans `config/stplug-in/*.lua` for manifest additions and hot-reloads without requiring Steam restarts.
+- **Dynamic Lua Manifest Reloading**: Automatically scans all manifest directories (including default `config/stplug-in/*.lua` and custom paths configured in `opensteamtool.toml`) for manifest additions and hot-reloads without requiring Steam restarts.
 - **CloudRedirect Compatibility**: Full native support for third-party cloud storage providers (Google Drive, OneDrive, Cloudflare R2).
 - **Zero Configuration Overrides**: Transparent API proxying ensuring full Windows system binary stability.
 
