@@ -1,8 +1,8 @@
 LIBRARY "version"
 EXPORTS
-    GetFileVersionInfoA = Proxy_GetFileVersionInfoA
-    GetFileVersionInfoW = Proxy_GetFileVersionInfoW
-    GetFileVersionInfoSizeA = Proxy_GetFileVersionInfoSizeA
-    GetFileVersionInfoSizeW = Proxy_GetFileVersionInfoSizeW
-    VerQueryValueA = Proxy_VerQueryValueA
-    VerQueryValueW = Proxy_VerQueryValueW
+    GetFileVersionInfoA = _Proxy_GetFileVersionInfoA@16
+    GetFileVersionInfoW = _Proxy_GetFileVersionInfoW@16
+    GetFileVersionInfoSizeA = _Proxy_GetFileVersionInfoSizeA@8
+    GetFileVersionInfoSizeW = _Proxy_GetFileVersionInfoSizeW@8
+    VerQueryValueA = _Proxy_VerQueryValueA@16
+    VerQueryValueW = _Proxy_VerQueryValueW@16
