@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/icebreaker.png" width="160" alt="IceBreaker Icon" />
+
 # IceBreaker
 
 A lightweight, native single-DLL Steam hook for automated Lua plugin & manifest loading.
