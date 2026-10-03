@@ -6,7 +6,7 @@
 
 A lightweight, native single-DLL Steam hook for automated Lua plugin & manifest loading.
 
-<a href="https://github.com/NetrunnerGames/IceBreaker/releases/tag/v1.0a"><img src="https://img.shields.io/badge/IceBreaker-v1.0a--alpha-090a0f?style=for-the-badge&labelColor=090a0f&logo=github&logoColor=00ffff" height="42" alt="IceBreaker Release" /></a>
+<a href="https://github.com/NetrunnerGames/IceBreaker/releases/tag/v1.0a"><img src="https://img.shields.io/badge/IceBreaker-v1.0a-090a0f?style=for-the-badge&labelColor=090a0f&logo=github&logoColor=00ffff" height="42" alt="IceBreaker Release" /></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-090a0f?style=for-the-badge&labelColor=090a0f&logo=open-source-initiative&logoColor=3da639" height="42" alt="License" /></a>
 
 </div>
