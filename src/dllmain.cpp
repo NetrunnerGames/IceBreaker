@@ -2,6 +2,11 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <string>
+#include <thread>
+#include "Core/HookManager.h"
+#include "Core/PatchEngine.h"
+#include "Steam/Interfaces.h"
+#include "Steam/LuaLoader.h"
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -80,6 +85,29 @@ BOOL WINAPI Proxy_VerQueryValueW(LPCVOID block, LPCWSTR subblock, LPVOID* buffer
 
 }
 
+static void InitializeIceBreaker()
+{
+    IceBreaker::HookManager::Log("IceBreaker initializing...");
+    IceBreaker::HookManager::Initialize();
+
+    // Load manifests from config/stplug-in
+    IceBreaker::LuaLoader::LoadPluginManifests();
+
+    // Hook CreateInterface and SteamInternal_CreateInterface
+    IceBreaker::Interfaces::HookFactories();
+
+    // Wait for steamui.dll to load if not already loaded, then apply in-memory patterns
+    std::thread([]() {
+        int attempts = 0;
+        while (!GetModuleHandleW(L"steamui.dll") && attempts < 50) {
+            Sleep(200);
+            attempts++;
+        }
+        Sleep(500); // Give loader a brief window to complete imports
+        IceBreaker::PatchEngine::ApplyInMemoryPatches();
+    }).detach();
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     switch (ul_reason_for_call)
@@ -87,8 +115,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         LoadRealVersionDll();
+        std::thread(InitializeIceBreaker).detach();
         break;
     case DLL_PROCESS_DETACH:
+        IceBreaker::HookManager::Shutdown();
         if (g_realVersionDll)
         {
             FreeLibrary(g_realVersionDll);
