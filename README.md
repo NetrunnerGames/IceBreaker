@@ -6,7 +6,7 @@
 
 A lightweight, native single-DLL Steam hook for automated Lua plugin & manifest loading.
 
-<a href="https://github.com/NetrunnerGames/IceBreaker/releases/tag/v1.0a"><img src="https://img.shields.io/badge/IceBreaker-v1.0a-090a0f?style=for-the-badge&labelColor=090a0f&logo=github&logoColor=00ffff" height="42" alt="IceBreaker Release" /></a>
+<a href="https://github.com/NetrunnerGames/IceBreaker/releases/tag/v2.0.0"><img src="https://img.shields.io/badge/IceBreaker-v2.0.0-090a0f?style=for-the-badge&labelColor=090a0f&logo=github&logoColor=00ffff" height="42" alt="IceBreaker Release" /></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-090a0f?style=for-the-badge&labelColor=090a0f&logo=open-source-initiative&logoColor=3da639" height="42" alt="License" /></a>
 
 </div>
@@ -19,21 +19,22 @@ A lightweight, native single-DLL Steam hook for automated Lua plugin & manifest 
 
 ## Overview
 
-**IceBreaker** (`version.dll`) is a self-contained, native 64-bit/32-bit proxy DLL designed to hook into Steam desktop client processes. It forwards system version API calls to Windows system binaries while initializing internal hook procedures for loading Lua manifests and CEF plugin extensions.
+**IceBreaker** (`version.dll`) is a self-contained, native 64-bit proxy DLL designed to hook into Steam desktop client processes. It forwards system version API calls to Windows system binaries while initializing dynamic interface interception (`SteamInternal_CreateInterface`) and in-memory pattern scanning to load Lua manifests and CEF plugin extensions.
 
 ## Key Features
 
 - **Single-DLL Footprint**: Operates as a single proxy DLL (`version.dll`) placed directly in the Steam root directory.
-- **Dynamic Lua Manifest Reloading**: Automatically scans all manifest directories (including default `config/stplug-in/*.lua` and custom configured paths) for manifest additions and hot-reloads without requiring Steam restarts.
-- **CloudRedirect Compatibility**: Full native support for third-party cloud storage providers (Google Drive, OneDrive, Cloudflare R2).
-- **Zero Configuration Overrides**: Transparent API proxying ensuring full Windows system binary stability.
+- **Dynamic Interface Interception**: Automatically hooks runtime Steam client factory interfaces without relying on brittle hardcoded IPC offsets or static build TOMLs.
+- **In-Memory Pattern Scanning**: Automatically scans and patches core SteamUI and SteamClient functions dynamically across Steam updates.
+- **Dynamic Lua Manifest Reloading**: Scans all manifest directories (`config/stplug-in/*.lua`) for manifest additions and hot-reloads without requiring Steam restarts.
+- **Zero Configuration Overrides**: Transparent system API export proxying ensuring full Windows OS stability.
 
 ---
 
 ## Deployment & Usage
 
 ### Manual Installation
-1. Download `version.dll` from the latest [Release (v1.0a)](https://github.com/NetrunnerGames/IceBreaker/releases/tag/v1.0a).
+1. Download `version.dll` from the latest [Release (v2.0.0)](https://github.com/NetrunnerGames/IceBreaker/releases/tag/v2.0.0).
 2. Copy `version.dll` into your Steam client installation root folder (e.g. `C:\Program Files (x86)\Steam\`).
 3. Launch Steam.
 
