@@ -20,6 +20,7 @@ set(ICEBREAKER_SOURCES
     src/Core/Scanner.cpp
     src/Core/HookManager.cpp
     src/Core/PatchEngine.cpp
+    src/Proxy/VersionProxy.cpp
     src/Steam/AppManager.cpp
     src/Steam/LuaLoader.cpp
     src/Steam/Interfaces.cpp

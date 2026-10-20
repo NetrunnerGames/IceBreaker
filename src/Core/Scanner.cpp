@@ -48,15 +48,53 @@ uintptr_t Scanner::Scan(uintptr_t start, size_t length, const std::string& patte
     return 0;
 }
 
-uintptr_t Scanner::FindPattern(HMODULE module, const std::string& pattern) {
+uintptr_t Scanner::ScanModule(HMODULE module, const std::string& pattern) {
     if (!module) return 0;
+    for (const auto& [base, size] : ExecutableRanges(module)) {
+        if (uintptr_t hit = Scan(base, size, pattern)) return hit;
+    }
+    return 0;
+}
+
+std::vector<std::pair<uintptr_t, size_t>> Scanner::ExecutableRanges(HMODULE module) {
+    std::vector<std::pair<uintptr_t, size_t>> ranges;
 
     MODULEINFO modInfo = { 0 };
     if (!GetModuleInformation(GetCurrentProcess(), module, &modInfo, sizeof(MODULEINFO))) {
-        return 0;
+        return ranges;
     }
 
-    return Scan(reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage, pattern);
+    auto* base = reinterpret_cast<const uint8_t*>(modInfo.lpBaseOfDll);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return ranges;
+
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return ranges;
+
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            ranges.emplace_back(reinterpret_cast<uintptr_t>(base + section->VirtualAddress), section->Misc.VirtualSize);
+        }
+    }
+
+    // Fallback: no executable section found (unexpected) — scan the whole image.
+    if (ranges.empty()) {
+        ranges.emplace_back(reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
+    }
+    return ranges;
+}
+
+bool Scanner::IsInModule(HMODULE module, uintptr_t addr) {
+    if (!module) return false;
+    MODULEINFO modInfo = { 0 };
+    if (!GetModuleInformation(GetCurrentProcess(), module, &modInfo, sizeof(MODULEINFO))) return false;
+    uintptr_t base = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
+    return addr >= base && addr < base + modInfo.SizeOfImage;
+}
+
+uintptr_t Scanner::FindPattern(HMODULE module, const std::string& pattern) {
+    return ScanModule(module, pattern);
 }
 
 uintptr_t Scanner::FindPattern(const std::wstring& moduleName, const std::string& pattern) {

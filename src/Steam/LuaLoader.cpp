@@ -5,8 +5,12 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <thread>
 
 namespace IceBreaker {
+
+std::atomic<bool> LuaLoader::s_stopFlag{ false };
+std::atomic<bool> LuaLoader::s_watcherRunning{ false };
 
 std::wstring LuaLoader::GetSteamPluginDir() {
     wchar_t exePath[MAX_PATH];
@@ -48,19 +52,18 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
     }
 }
 
-bool LuaLoader::LoadPluginManifests() {
+void LuaLoader::ReloadAll() {
     std::wstring pluginDir = GetSteamPluginDir();
-    if (pluginDir.empty()) return false;
+    if (pluginDir.empty()) return;
 
-    HookManager::Log("Scanning for manifests in: " + std::string(pluginDir.begin(), pluginDir.end()));
+    AppManager::Get().Clear();
 
     std::wstring searchPattern = pluginDir + L"\\*.lua";
     WIN32_FIND_DATAW findData;
     HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
 
     if (hFind == INVALID_HANDLE_VALUE) {
-        HookManager::Log("No .lua files found in plugin directory.");
-        return false;
+        return;
     }
 
     size_t count = 0;
@@ -73,10 +76,59 @@ bool LuaLoader::LoadPluginManifests() {
     } while (FindNextFileW(hFind, &findData));
 
     FindClose(hFind);
-
-    HookManager::Log("Loaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " + 
+    HookManager::Log("Reloaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
                      std::to_string(AppManager::Get().GetUnlockedCount()));
+}
+
+bool LuaLoader::LoadPluginManifests() {
+    std::wstring pluginDir = GetSteamPluginDir();
+    if (pluginDir.empty()) return false;
+
+    // Narrow log conversion is best-effort for the ASCII-only Steam-root case.
+    std::string dirNarrow;
+    dirNarrow.reserve(pluginDir.size());
+    for (wchar_t ch : pluginDir) dirNarrow.push_back(static_cast<char>(ch));
+    HookManager::Log("Scanning for manifests in: " + dirNarrow);
+
+    ReloadAll();
+    if (AppManager::Get().GetUnlockedCount() == 0) {
+        HookManager::Log("No .lua files found in plugin directory.");
+        return false;
+    }
     return true;
+}
+
+void LuaLoader::WatcherLoop(std::wstring pluginDir) {
+    HANDLE hChange = FindFirstChangeNotificationW(pluginDir.c_str(), FALSE,
+                                                  FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+    if (hChange == INVALID_HANDLE_VALUE) return;
+
+    while (!s_stopFlag.load()) {
+        DWORD wait = WaitForSingleObject(hChange, 500);
+        if (s_stopFlag.load()) break;
+        if (wait == WAIT_OBJECT_0) {
+            // Editors often write multiple times in quick succession; debounce.
+            Sleep(500);
+            ReloadAll();
+            if (!FindNextChangeNotification(hChange)) break;
+        }
+    }
+    FindCloseChangeNotification(hChange);
+}
+
+void LuaLoader::StartReloadWatcher() {
+    std::wstring pluginDir = GetSteamPluginDir();
+    if (pluginDir.empty()) return;
+    bool expected = false;
+    if (!s_watcherRunning.compare_exchange_strong(expected, true)) return; // already running
+    s_stopFlag.store(false);
+    std::thread(WatcherLoop, pluginDir).detach();
+    HookManager::Log("Manifest hot-reload watcher started.");
+}
+
+void LuaLoader::StopReloadWatcher() {
+    s_stopFlag.store(true);
+    s_watcherRunning.store(false);
 }
 
 } // namespace IceBreaker
