@@ -47,6 +47,8 @@ private:
     static void WrapFamily(void* instance, const char* tag, const std::vector<VTableEntry>& entries);
     static void WrapClientUser(void* clientUser);
     static void WrapClientUtils(void* clientUtils);
+    // Called with the interface lock held. Returns false while the anchor is pending.
+    static bool TryHookClientUserLocked(void* clientUser);
 };
 
 } // namespace IceBreaker

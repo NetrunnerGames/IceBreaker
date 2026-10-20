@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 #include <mutex>
-
 namespace IceBreaker {
 
 struct DLCInfo {
@@ -19,6 +18,7 @@ public:
 
     void AddUnlockedApp(uint32_t appId);
     bool IsAppUnlocked(uint32_t appId) const;
+    void GetUnlockedApps(std::vector<uint32_t>& out) const;
 
     void SetAppDLCs(uint32_t appId, const std::vector<uint32_t>& dlcs);
     bool IsDLCUnlocked(uint32_t appId, uint32_t dlcId) const;

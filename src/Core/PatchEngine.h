@@ -21,6 +21,10 @@ public:
     /// Publishes a freshly resolved pattern address into the session cache.
     static void CacheResolved(const std::string& name, uintptr_t addr);
 
+    /// Re-applies manifest additions to the injected package license after a
+    /// hot reload. No-op until the fake license has been initialized.
+    static void RefreshLicense();
+
     /// Address of the steamclient64.dll module hosting the client interfaces.
     static uintptr_t ClientBase();
     /// Address of the steamui.dll module hosting the library UI.

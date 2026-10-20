@@ -17,6 +17,11 @@ bool AppManager::IsAppUnlocked(uint32_t appId) const {
     return m_unlockedApps.find(appId) != m_unlockedApps.end();
 }
 
+void AppManager::GetUnlockedApps(std::vector<uint32_t>& out) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    out.assign(m_unlockedApps.begin(), m_unlockedApps.end());
+}
+
 void AppManager::SetAppDLCs(uint32_t appId, const std::vector<uint32_t>& dlcs) {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto& set = m_appDLCs[appId];

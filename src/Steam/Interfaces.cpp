@@ -21,6 +21,8 @@ static pfnSteamInternal_CreateInterface oSteamInternal_CreateInterface = nullptr
 static std::mutex g_interfaceMutex;
 static std::set<void*> g_wrappedVTables;     // vptrs already mapped to the dispatch table
 static void* g_ownershipAnchor = nullptr;    // resolved IClientUser::CheckAppOwnership
+static std::vector<void*> g_pendingClientUser; // CLIENTUSER instances captured before the anchor resolved
+static std::set<void*> g_clientUserWrapped;  // IClientUser vptrs already hooked
 static uint32_t g_currentAppId = 0;
 
 // ── Virtual-hook map ─────────────────────────────────────────────────
@@ -103,8 +105,16 @@ static bool Hook_ClientCheckAppOwnership(void* pThis, uint32_t appId, void* pOwn
 }
 
 void Interfaces::SetOwnershipAnchor(void* address) {
-    std::lock_guard<std::mutex> lock(g_interfaceMutex);
-    g_ownershipAnchor = address;
+    std::vector<void*> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_interfaceMutex);
+        if (g_ownershipAnchor) return;
+        g_ownershipAnchor = address;
+        pending.swap(g_pendingClientUser);
+    }
+    for (void* inst : pending) {
+        WrapClientUser(inst);
+    }
 }
 
 void Interfaces::NoteClientAppContext(uint32_t appId) {
@@ -160,22 +170,16 @@ void Interfaces::WrapFamily(void* instance, const char* tag, const std::vector<V
     (void)tag;
 }
 
-void Interfaces::WrapClientUser(void* clientUser) {
-    if (!clientUser) return;
-    // vtable hook for the client family is anchor-based: resolved at runtime once
-    // PatchEngine publishes the CheckAppOwnership address. Wrapped on each capture.
-    void* anchor;
-    {
-        std::lock_guard<std::mutex> lock(g_interfaceMutex);
-        anchor = g_ownershipAnchor;
-    }
-    if (!anchor) {
-        HookManager::Log("CLIENTUSER captured; CheckAppOwnership anchor not yet resolved (pattern scan pending).");
-        return;
-    }
+// Called with g_interfaceMutex held. Returns true once the vtable hook has been
+// applied (or is impossible for this instance); false while the anchor is pending.
+bool Interfaces::TryHookClientUserLocked(void* clientUser) {
+    if (!clientUser) return true;
+
+    void* anchor = g_ownershipAnchor;
+    if (!anchor) return false;
 
     void** vtable = *reinterpret_cast<void***>(clientUser);
-    if (!vtable) return;
+    if (!vtable) return true;
 
     const size_t kMaxIClientUserVirtuals = 512;
     for (size_t i = 0; i < kMaxIClientUserVirtuals && vtable[i]; ++i) {
@@ -185,10 +189,23 @@ void Interfaces::WrapClientUser(void* clientUser) {
             HookVTable(clientUser, "IClientUser::CheckAppOwnership", i,
                        reinterpret_cast<void*>(&Hook_ClientCheckAppOwnership),
                        reinterpret_cast<void**>(&oClientCheckAppOwnership));
-            return;
+            return true;
         }
     }
     HookManager::Log("CLIENTUSER: anchor resolved but not present in captured vtable.");
+    return true;
+}
+
+void Interfaces::WrapClientUser(void* clientUser) {
+    if (!clientUser) return;
+    std::lock_guard<std::mutex> lock(g_interfaceMutex);
+    void** vtable = *reinterpret_cast<void***>(clientUser);
+    if (vtable && !g_clientUserWrapped.insert(vtable).second) return; // already hooked
+    if (!TryHookClientUserLocked(clientUser)) {
+        // Anchor not resolved yet: remember the instance for a later attempt.
+        if (vtable) g_clientUserWrapped.erase(vtable);
+        g_pendingClientUser.push_back(clientUser);
+    }
 }
 
 void Interfaces::WrapClientUtils(void* clientUtils) {
@@ -203,12 +220,13 @@ void Interfaces::WrapCaptured(void* instance, const char* name) {
 
     const std::lock_guard<std::mutex> lock(g_interfaceMutex);
     void** vtable = *reinterpret_cast<void***>(instance);
-    if (vtable && !g_wrappedVTables.insert(vtable).second) return; // vptr already mapped
+    if (vtable && g_wrappedVTables.count(vtable)) return; // vptr already mapped
+    if (vtable) g_wrappedVTables.insert(vtable);
 
     HookManager::Log("Interface captured: " + version);
 
     if (version.rfind("CLIENTUSER_INTERFACE_VERSION", 0) == 0) {
-        WrapClientUser(instance);
+        TryHookClientUserLocked(instance);
     } else if (version.rfind("CLIENTUTILS_INTERFACE_VERSION", 0) == 0) {
         WrapClientUtils(instance);
     } else if (version.rfind("SteamUser", 0) == 0) {
