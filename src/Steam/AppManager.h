@@ -17,6 +17,7 @@ public:
     static AppManager& Get();
 
     void AddUnlockedApp(uint32_t appId);
+    void RemoveUnlockedApp(uint32_t appId);
     bool IsAppUnlocked(uint32_t appId) const;
     void GetUnlockedApps(std::vector<uint32_t>& out) const;
 

@@ -14,11 +14,11 @@ public:
     // Hot-reload: watches the plugin dir and re-parses manifests on change
     static void StartReloadWatcher();
     static void StopReloadWatcher();
+    static void ReloadAll();
 
 private:
     static std::wstring GetSteamPluginDir();
     static void ParseLuaFile(const std::wstring& filePath);
-    static void ReloadAll();
     static void WatcherLoop(std::wstring pluginDir);
     static std::atomic<bool> s_stopFlag;
     static std::atomic<bool> s_watcherRunning;

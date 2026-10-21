@@ -24,6 +24,7 @@ set(ICEBREAKER_SOURCES
     src/Steam/AppManager.cpp
     src/Steam/LuaLoader.cpp
     src/Steam/Interfaces.cpp
+    src/IPC/IpcServer.cpp
 )
 
 add_library(version SHARED

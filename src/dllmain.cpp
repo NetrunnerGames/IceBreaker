@@ -7,6 +7,7 @@
 #include "Steam/Interfaces.h"
 #include "Steam/LuaLoader.h"
 #include "Proxy/VersionProxy.h"
+#include "IPC/IpcServer.h"
 
 // Export forwarders for system version.dll (see version.def).
 typedef BOOL(WINAPI* pfnGetFileVersionInfoA)(LPCSTR, DWORD, DWORD, LPVOID);
@@ -84,6 +85,9 @@ static void InitializeIceBreaker()
         IceBreaker::PatchEngine::ApplyInMemoryPatches();
     }).detach();
 
+    // Start IPC named pipe server for external controllers (DataJackUI / sidecars).
+    IceBreaker::IpcServer::Start();
+
     IceBreaker::HookManager::Log("IceBreaker initialization complete.");
 }
 
@@ -97,6 +101,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         std::thread(InitializeIceBreaker).detach();
         break;
     case DLL_PROCESS_DETACH:
+        IceBreaker::IpcServer::Stop();
         IceBreaker::LuaLoader::StopReloadWatcher();
         IceBreaker::HookManager::Shutdown();
         IceBreaker::VersionProxy::UnloadRealDll();

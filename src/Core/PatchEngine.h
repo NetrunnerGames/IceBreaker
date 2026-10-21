@@ -7,9 +7,7 @@
 namespace IceBreaker {
 
 /// <summary>
-/// Resolves the embedded AOB patterns on DLL attach, applies lightweight MinHook
-/// detours where behavior is defined, and caches the resolved function addresses
-/// (RVAs) for the remainder of the session.
+/// Resolves the embedded AOB patterns on DLL attach and applies safe, non-destructive hooks.
 /// </summary>
 class PatchEngine {
 public:
@@ -20,10 +18,6 @@ public:
 
     /// Publishes a freshly resolved pattern address into the session cache.
     static void CacheResolved(const std::string& name, uintptr_t addr);
-
-    /// Re-applies manifest additions to the injected package license after a
-    /// hot reload. No-op until the fake license has been initialized.
-    static void RefreshLicense();
 
     /// Address of the steamclient64.dll module hosting the client interfaces.
     static uintptr_t ClientBase();

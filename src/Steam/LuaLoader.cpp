@@ -1,7 +1,6 @@
 #include "LuaLoader.h"
 #include "AppManager.h"
 #include "../Core/HookManager.h"
-#include "../Core/PatchEngine.h"
 #include <windows.h>
 #include <fstream>
 #include <sstream>
@@ -79,9 +78,6 @@ void LuaLoader::ReloadAll() {
     FindClose(hFind);
     HookManager::Log("Reloaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
                      std::to_string(AppManager::Get().GetUnlockedCount()));
-
-    // Inject any newly added AppIDs into the already-initialized package license.
-    PatchEngine::RefreshLicense();
 }
 
 bool LuaLoader::LoadPluginManifests() {

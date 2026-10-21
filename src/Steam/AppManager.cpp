@@ -12,6 +12,11 @@ void AppManager::AddUnlockedApp(uint32_t appId) {
     m_unlockedApps.insert(appId);
 }
 
+void AppManager::RemoveUnlockedApp(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_unlockedApps.erase(appId);
+}
+
 bool AppManager::IsAppUnlocked(uint32_t appId) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_unlockedApps.find(appId) != m_unlockedApps.end();

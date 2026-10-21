@@ -1,0 +1,7 @@
+[+] Added native Win32 Named Pipe IPC server (\\.\pipe\IceBreaker_IPC) for zero-restart manifest reloading and dynamic unlock control
+[+] Added runtime command processing (PING, STATUS, GET_UNLOCKED, UNLOCK, LOCK, RELOAD)
+[+] Enhanced dynamic Steamworks SDK interface hooking for ISteamApps, ISteamUtils, and ISteamUser
+[+] Transitioned library UI management to out-of-process Chrome DevTools Protocol (CDP) debugging
+[-] Removed brittle in-memory CPackageInfo and CUtlVector struct mutations from OpenSteamTool
+[-] Removed fake package 0 license injection and unexported license refresh routines
+[-] Removed fragile binary memory patches in steamui.dll
