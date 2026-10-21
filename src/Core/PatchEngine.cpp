@@ -37,9 +37,10 @@ static std::string Hex(uintptr_t addr) {
 }
 
 // ── steamclient64: CheckAppOwnership hook ─────────────────────────────
-// AppOwnership layout: only release state and bOwnsLicense are written,
-// no internal structs or vectors are mutated.
-struct MinimalAppOwnership {
+// Full AppOwnership layout matching steamclient64.dll.
+// Setting bBorrowed and bFamilyShared to false prevents Steam from flagging
+// unlocked games with "From your Steam Family library".
+struct AppOwnership {
     uint32_t PackageId;
     uint32_t ReleaseState;
     uint32_t SteamId32;
@@ -52,12 +53,27 @@ struct MinimalAppOwnership {
     bool bOwnsLicense;
     bool bLicenseExpired;
     bool bIsPermanent;
+    bool bLowViolence;
+    bool bFreeLicense;
+    bool bRegionRestricted;
+    bool bFromFreeWeekend;
+    bool bLicenseLocked;
+    bool bLicensePending;
+    bool bRetailLicense;
+    bool bAutoGrant;
+    bool bLicensePermanent;
+    bool bGuestPass;
+    bool bBorrowed;
+    bool bAnySiteLicense;
+    bool bAllSiteLicenses;
+    bool bAllActivationRequired;
+    bool bFamilyShared;
 };
 
-typedef bool (*pfnCheckAppOwnership_t)(void* pThis, uint32_t appId, MinimalAppOwnership* pOwn);
+typedef bool (*pfnCheckAppOwnership_t)(void* pThis, uint32_t appId, AppOwnership* pOwn);
 static pfnCheckAppOwnership_t oCheckAppOwnership = nullptr;
 
-static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, MinimalAppOwnership* pOwn) {
+static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pOwn) {
     bool result = oCheckAppOwnership ? oCheckAppOwnership(pThis, appId, pOwn) : false;
 
     if (AppManager::Get().IsAppUnlocked(appId)) {
@@ -65,6 +81,13 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, MinimalAppOwners
             pOwn->bOwnsLicense = true;
             pOwn->ReleaseState = 4; // AppReleaseState_Released
             pOwn->bIsPermanent = true;
+            pOwn->bLicensePermanent = true;
+            pOwn->bFreeLicense = false;
+            pOwn->bBorrowed = false;
+            pOwn->bFamilyShared = false;
+            pOwn->bGuestPass = false;
+            pOwn->bLicenseLocked = false;
+            pOwn->bLicensePending = false;
             return true;
         }
     }
