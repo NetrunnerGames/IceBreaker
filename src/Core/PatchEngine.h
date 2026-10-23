@@ -24,6 +24,9 @@ public:
     /// Address of the steamui.dll module hosting the library UI.
     static uintptr_t UIBase();
 
+    /// Notifies Steam that the fake license (Package 0) has changed and flushes pending updates.
+    static void NotifyLicenseChanged();
+
 private:
     static std::unordered_map<std::string, uintptr_t> s_resolved;
 };
