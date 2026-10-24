@@ -1,3 +1,4 @@
-* Resilient Architecture: Decoupled IceBreaker from brittle Steam client memory layouts to survive weekly Valve updates.
-* IPC Named Pipe Bridge: Control unlocks, query status, and trigger manifest reloads dynamically via \\.\pipe\IceBreaker_IPC without restarting Steam.
-* Zero-Crash Interface Interception: Robust SmokeAPI-style SDK factory hooking with clean fallback.
+* Added autonomous in-memory HeuristicResolver for dynamic xref discovery
+* Added automatic function prologue detection to survive compiler layout shifts
+* Integrated Over-The-Air (OTA) pattern updates with local offline cache
+* Native depot decryption key injection via ConfigStore binary hook
