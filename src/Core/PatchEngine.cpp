@@ -281,15 +281,28 @@ struct AppOwnership {
     uint32_t SteamId32;
     uint32_t MasterSubscriptionAppID;
     uint32_t TrialSeconds;
-    bool bSubscribed;
-    bool bOccupied;
-    bool bTemporarilyUnavailable;
+    uint32_t ExistInPackageNums;
+    char PurchaseCountryCode[4];
+    uint32_t TimeStamp;
+    uint32_t TimeExpire;
+    bool bOwnsLicense;
+    bool bLicenseExpired;
+    bool bIsPermanent;
+    bool bLowViolence;
     bool bFreeLicense;
-    bool bBorrowed;
-    bool bFamilyShared;
-    bool bGuestPass;
+    bool bRegionRestricted;
+    bool bFromFreeWeekend;
     bool bLicenseLocked;
     bool bLicensePending;
+    bool bRetailLicense;
+    bool bAutoGrant;
+    bool bLicensePermanent;
+    bool bGuestPass;
+    bool bBorrowed;
+    bool bAnySiteLicense;
+    bool bAllSiteLicenses;
+    bool bAllActivationRequired;
+    bool bFamilyShared;
 };
 
 typedef bool (*pfnCheckAppOwnership)(void* pThis, uint32_t appId, AppOwnership* pOwnership);
@@ -306,17 +319,16 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
     }
 
     bool result = oCheckAppOwnership ? oCheckAppOwnership(pThis, appId, pOwn) : false;
+    TryInitFakeLicenseOnce();
 
     if (AppManager::Get().IsAppUnlocked(appId)) {
         if (pOwn) {
             pOwn->PackageId = kInjectedPackageId;
-            pOwn->ReleaseState = 1;
+            pOwn->bOwnsLicense = true;
+            pOwn->ReleaseState = 4; // AppReleaseState_Released
             pOwn->SteamId32 = GetActiveAccountID();
-            pOwn->MasterSubscriptionAppID = 0;
-            pOwn->TrialSeconds = 0;
-            pOwn->bSubscribed = true;
-            pOwn->bOccupied = false;
-            pOwn->bTemporarilyUnavailable = false;
+            pOwn->bIsPermanent = true;
+            pOwn->bLicensePermanent = true;
             pOwn->bFreeLicense = false;
             pOwn->bBorrowed = false;
             pOwn->bFamilyShared = false;
@@ -346,10 +358,19 @@ static pfnConfigStoreGetBinary_t oConfigStoreGetBinary = nullptr;
 static int32_t Hook_ConfigStoreGetBinary(void* pObject, int32_t eConfigStore, const char* KeyName, char* Key, uint32_t KeySize) {
     if (KeyName) {
         std::string name(KeyName);
-        // Expected shape: ".../<DepotId>\DecryptionKey" or "<DepotId>\DecryptionKey"
+        // Normalize slashes
+        for (char& c : name) {
+            if (c == '/') c = '\\';
+        }
+
+        // Expected shape: "...\\<DepotId>\\DecryptionKey" or "<DepotId>\\DecryptionKey"
         size_t last = name.find("\\DecryptionKey");
+        if (last == std::string::npos) {
+            last = name.find("\\decryptionkey");
+        }
+
         if (last != std::string::npos) {
-            size_t start = name.find_last_of("\\", last - 1);
+            size_t start = name.find_last_of('\\', last - 1);
             size_t idStart = (start != std::string::npos) ? (start + 1) : 0;
             std::string idStr = name.substr(idStart, last - idStart);
             try {
