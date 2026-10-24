@@ -1,5 +1,4 @@
-[+] Added in-memory HeuristicResolver for autonomous string literal cross-reference (xref) scanning
-[+] Added automatic x64 function prologue back-scanner to resolve target hooks when static signatures shift
-[+] Integrated dynamic OTA pattern feed retrieval with local caching fallback at config/icebreaker_patterns_cache.json
-[+] Multi-pattern fallback candidate scanning with wildcarded stack offsets
-[+] Native ConfigStore binary hook for direct depot decryption key injection
+[+] Restored binary-accurate AppOwnership struct layout in CheckAppOwnership hook
+[+] Set AppReleaseState to Released (4) and ensured bOwnsLicense is explicitly granted
+[+] Restored TryInitFakeLicenseOnce initialization trigger in ownership query flow
+[+] Added slash normalization and case-insensitive matching to ConfigStoreGetBinary decryption key queries

@@ -1,4 +1,3 @@
-* Added autonomous in-memory HeuristicResolver for dynamic xref discovery
-* Added automatic function prologue detection to survive compiler layout shifts
-* Integrated Over-The-Air (OTA) pattern updates with local offline cache
-* Native depot decryption key injection via ConfigStore binary hook
+* Restored exact AppOwnership struct memory layout and release state flags
+* Fixed unowned / encrypted state regression for unlocked apps and DLCs
+* Robust ConfigStoreGetBinary decryption key lookup with slash normalization
