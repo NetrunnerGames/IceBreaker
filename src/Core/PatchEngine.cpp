@@ -2,6 +2,7 @@
 #include "Scanner.h"
 #include "Patterns.h"
 #include "OtaClient.h"
+#include "HeuristicResolver.h"
 #include "HookManager.h"
 #include "../Steam/AppManager.h"
 #include "../Steam/Interfaces.h"
@@ -405,6 +406,17 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
             if (addr) {
                 PatchEngine::CacheResolved(pat.name, addr);
                 HookManager::Log(std::string(tag) + ": found " + pat.name + " via OTA at " + Hex(addr));
+                return;
+            }
+        }
+    }
+
+    // 3. Fallback to in-engine heuristic discovery (string / constant xref & prologue back-scan)
+    if (strcmp(pat.name, "ConfigStoreGetBinary") == 0) {
+        if (uintptr_t xref = HeuristicResolver::FindXref(reinterpret_cast<HMODULE>(base), "ConfigStore")) {
+            if (uintptr_t prologue = HeuristicResolver::FindPrologue(xref)) {
+                PatchEngine::CacheResolved(pat.name, prologue);
+                HookManager::Log(std::string(tag) + ": recovered " + pat.name + " via Heuristic at " + Hex(prologue));
                 return;
             }
         }

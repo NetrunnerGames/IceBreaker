@@ -16,6 +16,7 @@ public:
 
     // Fast masked scan restricted to the module's executable sections (ScanModule).
     static uintptr_t ScanModule(HMODULE module, const std::string& pattern);
+    static std::vector<std::pair<uintptr_t, size_t>> ExecutableRanges(HMODULE module);
 
     // Scans a specific memory range
     static uintptr_t Scan(uintptr_t start, size_t length, const std::string& pattern);
@@ -25,7 +26,6 @@ public:
 
 private:
     static std::vector<int> ParsePattern(const std::string& pattern);
-    static std::vector<std::pair<uintptr_t, size_t>> ExecutableRanges(HMODULE module);
 };
 
 } // namespace IceBreaker
