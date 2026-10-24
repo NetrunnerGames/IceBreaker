@@ -54,6 +54,12 @@ inline const std::vector<PatternDefinition> g_SteamClientPatterns = {
         "48 89 5C 24 10 57 48 83 EC 30 8B FA 48 8B D9 8B 51 08 8B 49 10 8D 04 39",
         0
     },
+    {
+        "ConfigStoreGetBinary",
+        "steamclient64.dll",
+        "40 53 55 56 57 48 83 EC 38 48 63 FA 49 8B E9",
+        0
+    },
 };
 
 } // namespace IceBreaker

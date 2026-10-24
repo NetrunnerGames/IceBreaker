@@ -24,6 +24,9 @@ public:
     void SetAppDLCs(uint32_t appId, const std::vector<uint32_t>& dlcs);
     bool IsDLCUnlocked(uint32_t appId, uint32_t dlcId) const;
 
+    void SetDepotKey(uint32_t depotId, const std::vector<uint8_t>& keyBytes);
+    bool GetDepotKey(uint32_t depotId, std::vector<uint8_t>& outKey) const;
+
     void Clear();
     size_t GetUnlockedCount() const;
 
@@ -32,6 +35,7 @@ private:
     mutable std::mutex m_mutex;
     std::unordered_set<uint32_t> m_unlockedApps;
     std::unordered_map<uint32_t, std::unordered_set<uint32_t>> m_appDLCs;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> m_depotKeys;
 };
 
 } // namespace IceBreaker

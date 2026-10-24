@@ -7,6 +7,7 @@
 #include <sstream>
 #include <cstdint>
 #include <vector>
+#include <cstring>
 
 namespace IceBreaker {
 
@@ -278,55 +279,42 @@ struct AppOwnership {
     uint32_t SteamId32;
     uint32_t MasterSubscriptionAppID;
     uint32_t TrialSeconds;
-    uint32_t ExistInPackageNums;
-    char PurchaseCountryCode[4];
-    uint32_t TimeStamp;
-    uint32_t TimeExpire;
-    bool bOwnsLicense;
-    bool bLicenseExpired;
-    bool bIsPermanent;
-    bool bLowViolence;
+    bool bSubscribed;
+    bool bOccupied;
+    bool bTemporarilyUnavailable;
     bool bFreeLicense;
-    bool bRegionRestricted;
-    bool bFromFreeWeekend;
+    bool bBorrowed;
+    bool bFamilyShared;
+    bool bGuestPass;
     bool bLicenseLocked;
     bool bLicensePending;
-    bool bRetailLicense;
-    bool bAutoGrant;
-    bool bLicensePermanent;
-    bool bGuestPass;
-    bool bBorrowed;
-    bool bAnySiteLicense;
-    bool bAllSiteLicenses;
-    bool bAllActivationRequired;
-    bool bFamilyShared;
 };
 
-typedef bool (*pfnCheckAppOwnership_t)(void* pThis, uint32_t appId, AppOwnership* pOwn);
-static pfnCheckAppOwnership_t oCheckAppOwnership = nullptr;
+typedef bool (*pfnCheckAppOwnership)(void* pThis, uint32_t appId, AppOwnership* pOwnership);
+static pfnCheckAppOwnership oCheckAppOwnership = nullptr;
 
 static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pOwn) {
     if (!g_pCUser) {
         g_pCUser = pThis;
         HookManager::Log("CheckAppOwnership: captured CUser");
         if (g_licenseRefreshPending) {
-            if (MarkLicenseAsChangedAndProcessUpdates()) {
-                g_licenseRefreshPending = false;
-            }
+            MarkLicenseAsChangedAndProcessUpdates();
+            g_licenseRefreshPending = false;
         }
     }
 
     bool result = oCheckAppOwnership ? oCheckAppOwnership(pThis, appId, pOwn) : false;
-    TryInitFakeLicenseOnce();
 
     if (AppManager::Get().IsAppUnlocked(appId)) {
         if (pOwn) {
             pOwn->PackageId = kInjectedPackageId;
-            pOwn->bOwnsLicense = true;
-            pOwn->ReleaseState = 4; // AppReleaseState_Released
+            pOwn->ReleaseState = 1;
             pOwn->SteamId32 = GetActiveAccountID();
-            pOwn->bIsPermanent = true;
-            pOwn->bLicensePermanent = true;
+            pOwn->MasterSubscriptionAppID = 0;
+            pOwn->TrialSeconds = 0;
+            pOwn->bSubscribed = true;
+            pOwn->bOccupied = false;
+            pOwn->bTemporarilyUnavailable = false;
             pOwn->bFreeLicense = false;
             pOwn->bBorrowed = false;
             pOwn->bFamilyShared = false;
@@ -347,6 +335,36 @@ static PackageInfo* Hook_GetPackageInfo(void* pThis, uint32_t packageId, uint64_
         TryInitFakeLicenseOnce();
     }
     return oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
+}
+
+// ── steamclient64: ConfigStoreGetBinary hook for depot decryption keys ─
+typedef int32_t (*pfnConfigStoreGetBinary_t)(void* pObject, int32_t eConfigStore, const char* KeyName, char* Key, uint32_t KeySize);
+static pfnConfigStoreGetBinary_t oConfigStoreGetBinary = nullptr;
+
+static int32_t Hook_ConfigStoreGetBinary(void* pObject, int32_t eConfigStore, const char* KeyName, char* Key, uint32_t KeySize) {
+    if (KeyName) {
+        std::string name(KeyName);
+        // Expected shape: ".../<DepotId>\DecryptionKey" or "<DepotId>\DecryptionKey"
+        size_t last = name.find("\\DecryptionKey");
+        if (last != std::string::npos) {
+            size_t start = name.find_last_of("\\", last - 1);
+            size_t idStart = (start != std::string::npos) ? (start + 1) : 0;
+            std::string idStr = name.substr(idStart, last - idStart);
+            try {
+                uint32_t depotId = std::stoul(idStr);
+                std::vector<uint8_t> keyBytes;
+                if (AppManager::Get().GetDepotKey(depotId, keyBytes)) {
+                    if (KeySize >= keyBytes.size()) {
+                        memcpy(Key, keyBytes.data(), keyBytes.size());
+                        HookManager::Log("ConfigStoreGetBinary: served decryption key for depot " + std::to_string(depotId));
+                        return static_cast<int32_t>(keyBytes.size());
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    return oConfigStoreGetBinary ? oConfigStoreGetBinary(pObject, eConfigStore, KeyName, Key, KeySize) : 0;
 }
 
 // ── steamui.dll: library visibility hook ──────────────────────────────
@@ -408,6 +426,12 @@ void PatchEngine::ApplyInMemoryPatches() {
                                     reinterpret_cast<void*>(&Hook_GetPackageInfo),
                                     reinterpret_cast<void**>(&oGetPackageInfo),
                                     "GetPackageInfo");
+        }
+        if (auto addr = ResolvedAddress("ConfigStoreGetBinary")) {
+            HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                    reinterpret_cast<void*>(&Hook_ConfigStoreGetBinary),
+                                    reinterpret_cast<void**>(&oConfigStoreGetBinary),
+                                    "ConfigStoreGetBinary");
         }
         if (auto addr = ResolvedAddress("MarkLicenseAsChanged")) {
             oMarkLicenseAsChanged = reinterpret_cast<pfnMarkLicenseAsChanged_t>(addr);

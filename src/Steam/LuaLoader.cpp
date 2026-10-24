@@ -2,16 +2,34 @@
 #include "AppManager.h"
 #include "../Core/HookManager.h"
 #include "../Core/PatchEngine.h"
-#include <windows.h>
 #include <fstream>
-#include <sstream>
 #include <regex>
+#include <string>
 #include <thread>
+#include <windows.h>
+#include <vector>
 
 namespace IceBreaker {
 
-std::atomic<bool> LuaLoader::s_stopFlag{ false };
-std::atomic<bool> LuaLoader::s_watcherRunning{ false };
+std::atomic<bool> LuaLoader::s_stopFlag{false};
+std::atomic<bool> LuaLoader::s_watcherRunning{false};
+
+static uint8_t ParseHexNibble(char c) {
+    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+    return 0;
+}
+
+static std::vector<uint8_t> ParseHex64(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    if (hex.length() != 64) return bytes;
+    bytes.reserve(32);
+    for (size_t i = 0; i < 64; i += 2) {
+        bytes.push_back(static_cast<uint8_t>((ParseHexNibble(hex[i]) << 4) | ParseHexNibble(hex[i + 1])));
+    }
+    return bytes;
+}
 
 std::wstring LuaLoader::GetSteamPluginDir() {
     wchar_t exePath[MAX_PATH];
@@ -30,17 +48,24 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
 
     std::string line;
     // Common patterns in stplug-in lua manifests:
-    // addappid(480) or addappid( 480 ) or addappid(480, 1, "...")
+    // addappid(480) or addappid( 480 ) or addappid(480, 0, "de1f...")
     // set_dlc(480, 520) or setdlc(...)
-    std::regex addAppRegex(R"(addappid\s*\(\s*(\d+))", std::regex_constants::icase);
+    std::regex addAppKeyRegex(R"(addappid\s*\(\s*(\d+)(?:\s*,\s*\d+\s*,\s*["']([a-fA-F0-9]{64})["'])?)", std::regex_constants::icase);
     std::regex dlcRegex(R"((?:set_dlc|add_dlc|setdlc)\s*\(\s*(\d+)\s*,\s*(\d+))", std::regex_constants::icase);
     std::regex rawAppRegex(R"(app(?:id)?\s*=\s*(\d+))", std::regex_constants::icase);
 
     while (std::getline(file, line)) {
         std::smatch match;
-        if (std::regex_search(line, match, addAppRegex)) {
+        if (std::regex_search(line, match, addAppKeyRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             AppManager::Get().AddUnlockedApp(appId);
+            if (match.size() > 2 && match[2].matched) {
+                std::string keyHex = match[2].str();
+                std::vector<uint8_t> keyBytes = ParseHex64(keyHex);
+                if (keyBytes.size() == 32) {
+                    AppManager::Get().SetDepotKey(appId, keyBytes);
+                }
+            }
         } else if (std::regex_search(line, match, dlcRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t dlcId = std::stoul(match[2].str());

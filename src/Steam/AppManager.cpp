@@ -45,10 +45,26 @@ bool AppManager::IsDLCUnlocked(uint32_t appId, uint32_t dlcId) const {
     return m_unlockedApps.find(dlcId) != m_unlockedApps.end();
 }
 
+void AppManager::SetDepotKey(uint32_t depotId, const std::vector<uint8_t>& keyBytes) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_depotKeys[depotId] = keyBytes;
+}
+
+bool AppManager::GetDepotKey(uint32_t depotId, std::vector<uint8_t>& outKey) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_depotKeys.find(depotId);
+    if (it != m_depotKeys.end()) {
+        outKey = it->second;
+        return true;
+    }
+    return false;
+}
+
 void AppManager::Clear() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_unlockedApps.clear();
     m_appDLCs.clear();
+    m_depotKeys.clear();
 }
 
 size_t AppManager::GetUnlockedCount() const {
