@@ -1,6 +1,7 @@
 #include "PatchEngine.h"
 #include "Scanner.h"
 #include "Patterns.h"
+#include "OtaClient.h"
 #include "HookManager.h"
 #include "../Steam/AppManager.h"
 #include "../Steam/Interfaces.h"
@@ -382,15 +383,34 @@ static bool Hook_ShouldShowAppInLibrary(void* pThis, uint32_t appId) {
 }
 
 // ── resolution bookkeeping ────────────────────────────────────────────
-static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* tag) {
+static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* tag,
+                    const std::unordered_map<std::string, std::vector<std::string>>& otaPatterns) {
     if (PatchEngine::ResolvedAddress(pat.name)) return;
-    uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), pat.pattern);
-    if (!addr) {
-        HookManager::Log(std::string(tag) + ": pattern not matched: " + pat.name + " (non-fatal)");
-        return;
+
+    // 1. Try local patterns first
+    for (const auto& sig : pat.patterns) {
+        uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), sig);
+        if (addr) {
+            PatchEngine::CacheResolved(pat.name, addr);
+            HookManager::Log(std::string(tag) + ": found " + pat.name + " at " + Hex(addr));
+            return;
+        }
     }
-    PatchEngine::CacheResolved(pat.name, addr);
-    HookManager::Log(std::string(tag) + ": found " + pat.name + " at " + Hex(addr));
+
+    // 2. Fallback to OTA patterns if available
+    auto it = otaPatterns.find(pat.name);
+    if (it != otaPatterns.end()) {
+        for (const auto& otaSig : it->second) {
+            uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), otaSig);
+            if (addr) {
+                PatchEngine::CacheResolved(pat.name, addr);
+                HookManager::Log(std::string(tag) + ": found " + pat.name + " via OTA at " + Hex(addr));
+                return;
+            }
+        }
+    }
+
+    HookManager::Log(std::string(tag) + ": pattern not matched: " + pat.name + " (non-fatal)");
 }
 
 void PatchEngine::ApplyInMemoryPatches() {
@@ -398,9 +418,15 @@ void PatchEngine::ApplyInMemoryPatches() {
     const uintptr_t client = ClientBase();
     HookManager::Log("Scanning in-memory patterns (steamui=" + Hex(ui) + " steamclient64=" + Hex(client) + ")");
 
+    // Query OTA pattern feed asynchronously or on startup with local cache fallback
+    auto otaPatterns = OtaClient::FetchPatterns();
+    if (!otaPatterns.empty()) {
+        HookManager::Log("OTA: Loaded " + std::to_string(otaPatterns.size()) + " pattern definitions from OTA/cache.");
+    }
+
     if (ui) {
         for (const auto& pat : g_SteamUIPatterns) {
-            Resolve(pat, ui, "steamui");
+            Resolve(pat, ui, "steamui", otaPatterns);
         }
         if (auto addr = ResolvedAddress("ShouldShowAppInLibrary")) {
             HookManager::CreateHook(reinterpret_cast<void*>(addr),
@@ -412,7 +438,7 @@ void PatchEngine::ApplyInMemoryPatches() {
 
     if (client) {
         for (const auto& pat : g_SteamClientPatterns) {
-            Resolve(pat, client, "steamclient64");
+            Resolve(pat, client, "steamclient64", otaPatterns);
         }
         if (auto addr = ResolvedAddress("CheckAppOwnership")) {
             HookManager::CreateHook(reinterpret_cast<void*>(addr),

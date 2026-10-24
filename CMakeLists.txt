@@ -40,4 +40,5 @@ target_include_directories(version PRIVATE
 target_link_libraries(version PRIVATE
     shlwapi
     psapi
+    wininet
 )
