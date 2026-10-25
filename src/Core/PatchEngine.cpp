@@ -44,7 +44,7 @@ static std::string Hex(uintptr_t addr) {
 // (e.g. loginusers.vdf / userdata directory) so that AppOwnership can explicitly
 // assign ownership to the local user. When SteamId32 matches the current user,
 // Steam's CEF UI suppresses the "From your Steam Family library" badge entirely.
-static uint32_t GetActiveAccountID() {
+uint32_t PatchEngine::GetActiveAccountID() {
     static uint32_t s_cachedAccountId = 0;
     if (s_cachedAccountId != 0) return s_cachedAccountId;
 
@@ -326,7 +326,7 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
             pOwn->PackageId = kInjectedPackageId;
             pOwn->bOwnsLicense = true;
             pOwn->ReleaseState = 4; // AppReleaseState_Released
-            pOwn->SteamId32 = GetActiveAccountID();
+            pOwn->SteamId32 = PatchEngine::GetActiveAccountID();
             pOwn->bIsPermanent = true;
             pOwn->bLicensePermanent = true;
             pOwn->bFreeLicense = false;

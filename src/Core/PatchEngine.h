@@ -27,6 +27,9 @@ public:
     /// Notifies Steam that the fake license (Package 0) has changed and flushes pending updates.
     static void NotifyLicenseChanged();
 
+    /// Returns the active user's 32-bit Steam AccountID from Steam config / userdata.
+    static uint32_t GetActiveAccountID();
+
 private:
     static std::unordered_map<std::string, uintptr_t> s_resolved;
 };

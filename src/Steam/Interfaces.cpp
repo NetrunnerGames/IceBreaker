@@ -77,20 +77,161 @@ static uint32_t Hook_GetAppID(void* pThis) {
 }
 
 // ── Hook: flat ISteamUser tickets ────────────────────────────────────
-typedef uint32_t (*pfnRequestEncryptedAppTicket)(void* pThis, void* pDataToInclude, int cbDataToInclude);
+typedef uint64_t SteamAPICall_t;
+constexpr SteamAPICall_t k_uAPICallInvalid = 0;
+constexpr SteamAPICall_t k_uSynthesizedTicketCallHandle = 0x90001000ull;
+constexpr int k_iCallbackEncryptedAppTicketResponse = 154; // k_iSteamUserCallbacks (100) + 54
+
+struct EncryptedAppTicketResponse_t {
+    int m_eResult; // 1 = k_EResultOK
+};
+
+static std::vector<uint8_t> g_synthesizedTicket;
+static bool g_synthesizedCallPending = false;
+
+typedef uint64_t (*pfnRequestEncryptedAppTicket)(void* pThis, void* pDataToInclude, int cbDataToInclude);
 static pfnRequestEncryptedAppTicket oRequestEncryptedAppTicket = nullptr;
 
-static uint32_t Hook_RequestEncryptedAppTicket(void* pThis, void* pDataToInclude, int cbDataToInclude) {
+static uint64_t Hook_RequestEncryptedAppTicket(void* pThis, void* pDataToInclude, int cbDataToInclude) {
+    uint32_t appId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_interfaceMutex);
+        appId = g_currentAppId;
+    }
+
+    if (appId != 0 && AppManager::Get().IsAppUnlocked(appId)) {
+        HookManager::Log("RequestEncryptedAppTicket: synthesizing ticket for unlocked AppID " + std::to_string(appId));
+
+        std::lock_guard<std::mutex> lock(g_interfaceMutex);
+        g_synthesizedTicket.clear();
+
+        // Synthesize an encrypted app ticket buffer
+        // Layout:
+        // uint32 ticket_version_no = 1
+        // uint32 crc = 0
+        // uint32 cb_userdata = cbDataToInclude
+        // uint32 cb_ownershipticket = sizeof(tOWNERSHIPTICKET)
+        // userdata bytes...
+        // ownership ticket struct (length, version, steamid, appid, flags, times, licenses)
+
+        uint32_t accountId = PatchEngine::GetActiveAccountID();
+        uint64_t steamId64 = (accountId > 0) ? (76561197960265728ull + accountId) : 76561197960265728ull;
+
+        uint32_t userDataLen = (pDataToInclude && cbDataToInclude > 0) ? static_cast<uint32_t>(cbDataToInclude) : 0;
+        
+        // Ownership ticket payload (approx 128 bytes)
+        std::vector<uint8_t> ownershipPayload;
+        uint32_t version = 1;
+        uint32_t flags = 0;
+        uint32_t now = static_cast<uint32_t>(time(nullptr));
+        uint32_t expire = now + 86400 * 30; // 30 days
+        uint16_t licenseCount = 1;
+        uint32_t licensePkg = 0;
+        uint16_t dlcCount = 0;
+        uint16_t reserved = 0;
+
+        uint32_t ownershipLen = sizeof(uint32_t) * 7 + sizeof(uint64_t) + sizeof(uint16_t) * 3 + sizeof(uint32_t);
+        ownershipPayload.resize(ownershipLen, 0);
+
+        uint8_t* p = ownershipPayload.data();
+        *reinterpret_cast<uint32_t*>(p) = ownershipLen; p += 4;
+        *reinterpret_cast<uint32_t*>(p) = version; p += 4;
+        *reinterpret_cast<uint64_t*>(p) = steamId64; p += 8;
+        *reinterpret_cast<uint32_t*>(p) = appId; p += 4;
+        *reinterpret_cast<uint32_t*>(p) = 0x0100007f; p += 4; // 127.0.0.1
+        *reinterpret_cast<uint32_t*>(p) = 0x0100007f; p += 4;
+        *reinterpret_cast<uint32_t*>(p) = flags; p += 4;
+        *reinterpret_cast<uint32_t*>(p) = now; p += 4;
+        *reinterpret_cast<uint32_t*>(p) = expire; p += 4;
+        *reinterpret_cast<uint16_t*>(p) = licenseCount; p += 2;
+        *reinterpret_cast<uint32_t*>(p) = licensePkg; p += 4;
+        *reinterpret_cast<uint16_t*>(p) = dlcCount; p += 2;
+        *reinterpret_cast<uint16_t*>(p) = reserved; p += 2;
+
+        uint32_t headerLen = 16;
+        uint32_t totalLen = headerLen + userDataLen + static_cast<uint32_t>(ownershipPayload.size());
+        g_synthesizedTicket.resize(totalLen, 0);
+
+        uint8_t* out = g_synthesizedTicket.data();
+        *reinterpret_cast<uint32_t*>(out) = 1; out += 4; // version
+        *reinterpret_cast<uint32_t*>(out) = 0; out += 4; // crc
+        *reinterpret_cast<uint32_t*>(out) = userDataLen; out += 4;
+        *reinterpret_cast<uint32_t*>(out) = static_cast<uint32_t>(ownershipPayload.size()); out += 4;
+
+        if (userDataLen > 0 && pDataToInclude) {
+            std::memcpy(out, pDataToInclude, userDataLen);
+            out += userDataLen;
+        }
+
+        std::memcpy(out, ownershipPayload.data(), ownershipPayload.size());
+
+        g_synthesizedCallPending = true;
+        return k_uSynthesizedTicketCallHandle;
+    }
+
     HookManager::Log("RequestEncryptedAppTicket — deferring to Steam");
     return oRequestEncryptedAppTicket ? oRequestEncryptedAppTicket(pThis, pDataToInclude, cbDataToInclude) : 0;
 }
 
-typedef uint32_t (*pfnGetEncryptedAppTicket)(void* pThis, void* pTicket, int cbMaxTicket, uint32_t* pcbTicket);
+typedef bool (*pfnGetEncryptedAppTicket)(void* pThis, void* pTicket, int cbMaxTicket, uint32_t* pcbTicket);
 static pfnGetEncryptedAppTicket oGetEncryptedAppTicket = nullptr;
 
-static uint32_t Hook_GetEncryptedAppTicket(void* pThis, void* pTicket, int cbMaxTicket, uint32_t* pcbTicket) {
+static bool Hook_GetEncryptedAppTicket(void* pThis, void* pTicket, int cbMaxTicket, uint32_t* pcbTicket) {
+    uint32_t appId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_interfaceMutex);
+        appId = g_currentAppId;
+    }
+
+    if (appId != 0 && AppManager::Get().IsAppUnlocked(appId)) {
+        std::lock_guard<std::mutex> lock(g_interfaceMutex);
+        if (!g_synthesizedTicket.empty()) {
+            uint32_t sz = static_cast<uint32_t>(g_synthesizedTicket.size());
+            if (pcbTicket) *pcbTicket = sz;
+            if (pTicket && cbMaxTicket >= static_cast<int>(sz)) {
+                std::memcpy(pTicket, g_synthesizedTicket.data(), sz);
+                HookManager::Log("GetEncryptedAppTicket: returned synthesized ticket (" + std::to_string(sz) + " bytes) for AppID " + std::to_string(appId));
+                return true;
+            } else if (pTicket) {
+                HookManager::Log("GetEncryptedAppTicket: buffer too small (" + std::to_string(cbMaxTicket) + " < " + std::to_string(sz) + ")");
+                return false;
+            }
+            return true;
+        }
+    }
+
     HookManager::Log("GetEncryptedAppTicket — deferring to Steam");
-    return oGetEncryptedAppTicket ? oGetEncryptedAppTicket(pThis, pTicket, cbMaxTicket, pcbTicket) : 0;
+    return oGetEncryptedAppTicket ? oGetEncryptedAppTicket(pThis, pTicket, cbMaxTicket, pcbTicket) : false;
+}
+
+// ── Hook: ISteamUtils API Call Completion Detours ─────────────────────
+typedef bool (*pfnIsAPICallCompleted)(void* pThis, SteamAPICall_t hSteamAPICall, bool* pbFailed);
+static pfnIsAPICallCompleted oIsAPICallCompleted = nullptr;
+
+static bool Hook_IsAPICallCompleted(void* pThis, SteamAPICall_t hSteamAPICall, bool* pbFailed) {
+    if (hSteamAPICall == k_uSynthesizedTicketCallHandle) {
+        if (pbFailed) *pbFailed = false;
+        return true;
+    }
+    return oIsAPICallCompleted ? oIsAPICallCompleted(pThis, hSteamAPICall, pbFailed) : false;
+}
+
+typedef bool (*pfnGetAPICallResult)(void* pThis, SteamAPICall_t hSteamAPICall, void* pCallback,
+                                    int cubCallback, int iCallbackExpected, bool* pbFailed);
+static pfnGetAPICallResult oGetAPICallResult = nullptr;
+
+static bool Hook_GetAPICallResult(void* pThis, SteamAPICall_t hSteamAPICall, void* pCallback,
+                                  int cubCallback, int iCallbackExpected, bool* pbFailed) {
+    if (hSteamAPICall == k_uSynthesizedTicketCallHandle) {
+        if (pbFailed) *pbFailed = false;
+        if (pCallback && cubCallback >= sizeof(EncryptedAppTicketResponse_t)) {
+            EncryptedAppTicketResponse_t* res = reinterpret_cast<EncryptedAppTicketResponse_t*>(pCallback);
+            res->m_eResult = 1; // k_EResultOK
+            HookManager::Log("GetAPICallResult: satisfied synthesized ticket call handle with k_EResultOK");
+        }
+        return true;
+    }
+    return oGetAPICallResult ? oGetAPICallResult(pThis, hSteamAPICall, pCallback, cubCallback, iCallbackExpected, pbFailed) : false;
 }
 
 // ── Hook: IClientUser::CheckAppOwnership (client family) ─────────────
@@ -248,6 +389,12 @@ void Interfaces::WrapCaptured(void* instance, const char* name) {
             { "ISteamUtils::GetAppID", 9,
               reinterpret_cast<void*>(&Hook_GetAppID),
               reinterpret_cast<void**>(&oGetAppID) },
+            { "ISteamUtils::IsAPICallCompleted", 11,
+              reinterpret_cast<void*>(&Hook_IsAPICallCompleted),
+              reinterpret_cast<void**>(&oIsAPICallCompleted) },
+            { "ISteamUtils::GetAPICallResult", 13,
+              reinterpret_cast<void*>(&Hook_GetAPICallResult),
+              reinterpret_cast<void**>(&oGetAPICallResult) },
         };
         WrapFamily(instance, "SteamUtils", entries);
     } else if (version.rfind("STEAMAPPS_INTERFACE", 0) == 0) {
