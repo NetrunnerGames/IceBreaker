@@ -322,9 +322,10 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
     TryInitFakeLicenseOnce();
 
     // Genuinely owned via real licenses (present in more than one actual package): leave Steam's
-    // answer alone and remember it, so we never spoof on top of real ownership (OST parity).
+    // answer alone but keep the app marked Released so the library still lists it (OST parity).
     if (result && pOwn && pOwn->ExistInPackageNums > 1) {
         AppManager::Get().MarkOwned(appId);
+        if (pOwn) pOwn->ReleaseState = 4; // AppReleaseState_Released
         return result;
     }
 
@@ -764,12 +765,15 @@ void PatchEngine::ApplyInMemoryPatches() {
                                     reinterpret_cast<void**>(&oConfigStoreGetBinary),
                                     "ConfigStoreGetBinary");
         }
-        if (auto addr = ResolvedAddress("GetOrAddAppData")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_GetOrAddAppData),
-                                    reinterpret_cast<void**>(&oGetOrAddAppData),
-                                    "GetOrAddAppData");
-        }
+        // Disabled: marking injected ids skip_flag makes Steam treat them as PICS unknown apps,
+        // which hides them from the library UI (OST keeps its copy of this hook disabled for the
+        // same reason). The PICS token injection below resolves appinfo instead, online.
+        // if (auto addr = ResolvedAddress("GetOrAddAppData")) {
+        //     HookManager::CreateHook(reinterpret_cast<void*>(addr),
+        //                             reinterpret_cast<void*>(&Hook_GetOrAddAppData),
+        //                             reinterpret_cast<void**>(&oGetOrAddAppData),
+        //                             "GetOrAddAppData");
+        // }
         if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
             HookManager::CreateHook(reinterpret_cast<void*>(addr),
                                     reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
