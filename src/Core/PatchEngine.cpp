@@ -321,7 +321,14 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
     bool result = oCheckAppOwnership ? oCheckAppOwnership(pThis, appId, pOwn) : false;
     TryInitFakeLicenseOnce();
 
-    if (AppManager::Get().IsAppUnlocked(appId)) {
+    // Genuinely owned via real licenses (present in more than one actual package): leave Steam's
+    // answer alone and remember it, so we never spoof on top of real ownership (OST parity).
+    if (result && pOwn && pOwn->ExistInPackageNums > 1) {
+        AppManager::Get().MarkOwned(appId);
+        return result;
+    }
+
+    if (AppManager::Get().IsAppUnlocked(appId) && !AppManager::Get().IsMarkedOwned(appId)) {
         if (pOwn) {
             pOwn->PackageId = kInjectedPackageId;
             pOwn->bOwnsLicense = true;
@@ -388,6 +395,271 @@ static int32_t Hook_ConfigStoreGetBinary(void* pObject, int32_t eConfigStore, co
     }
 
     return oConfigStoreGetBinary ? oConfigStoreGetBinary(pObject, eConfigStore, KeyName, Key, KeySize) : 0;
+}
+
+// ── steamclient64: CAppInfoCache::GetOrAddAppData skip-flag hook ──────
+// Injected package ids (depot ids especially) can have only placeholder appinfo. That keeps
+// CClientAppManager::ProcessPendingLicenseUpdates waiting on appinfo that will never arrive,
+// which leaves the injected license half-applied and games fail to launch (Steam "Error 56").
+// Marking such entries skip_flag makes Steam treat them like PICS unknown_appids instead
+// (same fix OpenSteamTool applies in Hooks_Misc::GetOrAddAppData).
+struct CAppData {
+    void** vfptr;
+    uint32_t nAppID;
+    uint32_t ChangeNumber;
+    uint32_t LastChangeTimeStamp;
+    bool bSkipFlag;
+    bool bDeniedToken;
+    bool bMissingToken;
+    uint64_t accessToken;
+    uint8_t sha1Hash[20];
+
+    bool HasEmptyAppInfoSha() const {
+        static const uint8_t kEmptySha1[20] = {};
+        return memcmp(sha1Hash, kEmptySha1, sizeof(sha1Hash)) == 0;
+    }
+};
+
+typedef void* (*pfnGetOrAddAppData_t)(void* pCache, uint32_t appId, bool bCreate);
+static pfnGetOrAddAppData_t oGetOrAddAppData = nullptr;
+
+static void* Hook_GetOrAddAppData(void* pCache, uint32_t appId, bool bCreate) {
+    void* result = oGetOrAddAppData ? oGetOrAddAppData(pCache, appId, bCreate) : nullptr;
+
+    CAppData* app = static_cast<CAppData*>(result);
+    if (app && !bCreate && AppManager::Get().IsAppUnlocked(appId) &&
+        app->HasEmptyAppInfoSha() && !app->bSkipFlag) {
+        app->bSkipFlag = true;
+        HookManager::Log("GetOrAddAppData: flagged appId " + std::to_string(appId) +
+                         " as skip (unresolved appinfo, unblocking license updates)");
+    }
+    return result;
+}
+
+// ── steamclient64: CConnectionTransport::BBuildAndAsyncSendFrame hook ─
+// Outgoing CMsgClientPICSProductInfoRequest (eMsg 8903) patcher: injects the PICS access tokens
+// configured via addtoken(id, "token") lua lines, so Steam resolves appinfo for token-protected
+// injected apps. Packets without tokens are passed through untouched (zero overhead hot path).
+struct MsgHdr {
+    uint32_t eMsg;
+    uint32_t headerLength;
+};
+
+constexpr uint32_t kMsgHdrProtoFlag = 0x80000000;
+constexpr uint32_t kEMsgClientPICSProductInfoRequest = 8903;
+
+static bool UnpackSendPacket(const uint8_t* data, uint32_t size,
+                             uint32_t& eMsg, const uint8_t*& pHdr, uint32_t& cbHdr,
+                             const uint8_t*& pBody, uint32_t& cbBody) {
+    if (!data || size < sizeof(MsgHdr)) return false;
+    const MsgHdr* hdr = reinterpret_cast<const MsgHdr*>(data);
+    if (!(hdr->eMsg & kMsgHdrProtoFlag)) return false;
+    eMsg = hdr->eMsg & ~kMsgHdrProtoFlag;
+    cbHdr = hdr->headerLength;
+    uint32_t off = sizeof(MsgHdr) + cbHdr;
+    if (off > size) return false;
+    pHdr = data + sizeof(MsgHdr);
+    pBody = data + off;
+    cbBody = size - off;
+    return true;
+}
+
+static uint64_t ReadVarint(const uint8_t*& p, const uint8_t* end, bool& ok) {
+    uint64_t value = 0;
+    int shift = 0;
+    ok = false;
+    while (p < end && shift < 64) {
+        uint8_t b = *p++;
+        value |= static_cast<uint64_t>(b & 0x7F) << shift;
+        if (!(b & 0x80)) { ok = true; break; }
+        shift += 7;
+    }
+    return value;
+}
+
+static void WriteVarint(std::vector<uint8_t>& out, uint64_t value) {
+    while (true) {
+        uint8_t b = static_cast<uint8_t>(value & 0x7F);
+        value >>= 7;
+        if (value) out.push_back(b | 0x80);
+        else { out.push_back(b); break; }
+    }
+}
+
+// One parsed protobuf field kept as raw bytes so untouched fields round-trip byte-identical.
+struct ProtoField {
+    uint32_t fieldNumber;
+    uint8_t wireType;
+    std::vector<uint8_t> raw; // tag + payload
+};
+
+static bool ParseProtoFields(const uint8_t* p, const uint8_t* end, std::vector<ProtoField>& out) {
+    while (p < end) {
+        bool ok = false;
+        uint64_t key = ReadVarint(p, end, ok);
+        if (!ok) return false;
+        ProtoField f;
+        f.wireType = static_cast<uint8_t>(key & 7);
+        f.fieldNumber = static_cast<uint32_t>(key >> 3);
+        f.raw.push_back(static_cast<uint8_t>(key & 0xFF));
+        // Re-encode the full tag varint (multi-byte tags are rare; handle via WriteVarint).
+        f.raw.clear();
+        WriteVarint(f.raw, key);
+        switch (f.wireType) {
+            case 0: { // varint
+                uint64_t v = ReadVarint(p, end, ok);
+                if (!ok) return false;
+                WriteVarint(f.raw, v);
+                break;
+            }
+            case 1: { // fixed64
+                if (end - p < 8) return false;
+                f.raw.insert(f.raw.end(), p, p + 8); p += 8;
+                break;
+            }
+            case 2: { // length-delimited
+                uint64_t len = ReadVarint(p, end, ok);
+                if (!ok || end - p < len) return false;
+                WriteVarint(f.raw, len);
+                f.raw.insert(f.raw.end(), p, p + len); p += len;
+                break;
+            }
+            case 5: { // fixed32
+                if (end - p < 4) return false;
+                f.raw.insert(f.raw.end(), p, p + 4); p += 4;
+                break;
+            }
+            default: return false; // groups (3,4) are deprecated and never used here
+        }
+        out.push_back(std::move(f));
+    }
+    return true;
+}
+
+// Rebuild one apps submessage with the access token forced to the configured value. Returns false
+// when the submessage is malformed or needs no change.
+static bool PatchAppSubmessage(const std::vector<ProtoField>& fields, std::vector<ProtoField>& out) {
+    uint64_t appId = 0, currentToken = 0;
+    bool hasAppId = false, hasToken = false;
+    for (const auto& f : fields) {
+        if (f.fieldNumber == 1 && f.wireType == 0) {
+            // decode varint from raw payload
+            const uint8_t* q = f.raw.data() + 1;
+            const uint8_t* qEnd = f.raw.data() + f.raw.size();
+            bool ok = false;
+            appId = ReadVarint(q, qEnd, ok);
+            hasAppId = ok;
+        } else if (f.fieldNumber == 2 && f.wireType == 0) {
+            const uint8_t* q = f.raw.data() + 1;
+            const uint8_t* qEnd = f.raw.data() + f.raw.size();
+            bool ok = false;
+            currentToken = ReadVarint(q, qEnd, ok);
+            hasToken = ok;
+        }
+    }
+    if (!hasAppId) return false;
+
+    uint64_t wanted = 0;
+    if (!AppManager::Get().GetAccessToken(static_cast<uint32_t>(appId), wanted)) return false;
+    if (hasToken && currentToken == wanted) return false;
+
+    out.clear();
+    bool tokenWritten = false;
+    for (const auto& f : fields) {
+        if (f.fieldNumber == 2 && f.wireType == 0) {
+            if (!tokenWritten) {
+                ProtoField tok;
+                tok.fieldNumber = 2; tok.wireType = 0;
+                WriteVarint(tok.raw, (2ULL << 3) | 0);
+                WriteVarint(tok.raw, wanted);
+                out.push_back(std::move(tok));
+                tokenWritten = true;
+            }
+            continue; // drop the original token field
+        }
+        out.push_back(f);
+    }
+    if (!tokenWritten) {
+        ProtoField tok;
+        tok.fieldNumber = 2; tok.wireType = 0;
+        WriteVarint(tok.raw, (2ULL << 3) | 0);
+        WriteVarint(tok.raw, wanted);
+        out.push_back(std::move(tok));
+    }
+    return true;
+}
+
+static bool (*oBBuildAndAsyncSendFrame)(void*, uint32_t, uint8_t*, uint32_t) = nullptr;
+static uint8_t g_sendPatchBuffer[256 * 1024];
+
+static bool Hook_BBuildAndAsyncSendFrame(void* pObject, uint32_t opCode, uint8_t* pubData, uint32_t cubData) {
+    uint32_t eMsg = 0;
+    const uint8_t* pHdr = nullptr;
+    uint32_t cbHdr = 0;
+    const uint8_t* pBody = nullptr;
+    uint32_t cbBody = 0;
+
+    if (pubData && cubData >= sizeof(MsgHdr) &&
+        UnpackSendPacket(pubData, cubData, eMsg, pHdr, cbHdr, pBody, cbBody) &&
+        eMsg == kEMsgClientPICSProductInfoRequest &&
+        AppManager::Get().HasAnyAccessToken()) {
+        std::vector<ProtoField> top;
+        if (ParseProtoFields(pBody, pBody + cbBody, top)) {
+            bool changed = false;
+            std::vector<std::vector<uint8_t>> rebuilt(top.size());
+            for (size_t i = 0; i < top.size(); ++i) {
+                if (top[i].fieldNumber == 1 && top[i].wireType == 2) {
+                    // strip tag+len (already re-encoded in raw) → payload
+                    const uint8_t* q = top[i].raw.data() + 1;
+                    const uint8_t* qEnd = top[i].raw.data() + top[i].raw.size();
+                    bool ok = false;
+                    uint64_t len = ReadVarint(q, qEnd, ok);
+                    if (ok) {
+                        std::vector<ProtoField> inner;
+                        if (ParseProtoFields(q, q + len, inner)) {
+                            std::vector<ProtoField> patched;
+                            if (PatchAppSubmessage(inner, patched)) {
+                                // re-encode submessage payload
+                                std::vector<uint8_t> payload;
+                                for (const auto& f : patched) payload.insert(payload.end(), f.raw.begin(), f.raw.end());
+                                std::vector<uint8_t> nraw;
+                                WriteVarint(nraw, (1ULL << 3) | 2);
+                                WriteVarint(nraw, payload.size());
+                                nraw.insert(nraw.end(), payload.begin(), payload.end());
+                                rebuilt[i] = std::move(nraw);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (changed) {
+                std::vector<uint8_t> body;
+                for (size_t i = 0; i < top.size(); ++i) {
+                    const std::vector<uint8_t>& raw = rebuilt[i].empty() ? top[i].raw : rebuilt[i];
+                    body.insert(body.end(), raw.begin(), raw.end());
+                }
+
+                uint32_t newSize = sizeof(MsgHdr) + cbHdr + static_cast<uint32_t>(body.size());
+                if (newSize <= sizeof(g_sendPatchBuffer)) {
+                    uint8_t* out = g_sendPatchBuffer;
+                    memcpy(out, pubData, sizeof(MsgHdr) + cbHdr);
+                    memcpy(out + sizeof(MsgHdr) + cbHdr, body.data(), body.size());
+                    HookManager::Log("PICS: injected access tokens into CMsgClientPICSProductInfoRequest (" +
+                                     std::to_string(cbBody) + " -> " + std::to_string(body.size()) + " bytes)");
+                    return oBBuildAndAsyncSendFrame
+                        ? oBBuildAndAsyncSendFrame(pObject, opCode, out, newSize)
+                        : false;
+                }
+            }
+        }
+    }
+
+    return oBBuildAndAsyncSendFrame
+        ? oBBuildAndAsyncSendFrame(pObject, opCode, pubData, cubData)
+        : false;
 }
 
 // ── steamui.dll: library visibility hook ──────────────────────────────
@@ -491,6 +763,18 @@ void PatchEngine::ApplyInMemoryPatches() {
                                     reinterpret_cast<void*>(&Hook_ConfigStoreGetBinary),
                                     reinterpret_cast<void**>(&oConfigStoreGetBinary),
                                     "ConfigStoreGetBinary");
+        }
+        if (auto addr = ResolvedAddress("GetOrAddAppData")) {
+            HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                    reinterpret_cast<void*>(&Hook_GetOrAddAppData),
+                                    reinterpret_cast<void**>(&oGetOrAddAppData),
+                                    "GetOrAddAppData");
+        }
+        if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
+            HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                    reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
+                                    reinterpret_cast<void**>(&oBBuildAndAsyncSendFrame),
+                                    "BBuildAndAsyncSendFrame");
         }
         if (auto addr = ResolvedAddress("MarkLicenseAsChanged")) {
             oMarkLicenseAsChanged = reinterpret_cast<pfnMarkLicenseAsChanged_t>(addr);

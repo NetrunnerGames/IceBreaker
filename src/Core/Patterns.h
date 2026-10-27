@@ -80,6 +80,28 @@ inline const std::vector<PatternDefinition> g_SteamClientPatterns = {
         },
         0
     },
+    {
+        // CAppInfoCache::GetOrAddAppData — lets us flag injected ids with unresolved appinfo so
+        // CClientAppManager stops blocking pending license updates on them (Error 56 fix).
+        "GetOrAddAppData",
+        "steamclient64.dll",
+        {
+            "48 83 EC 58 48 8B 05 ?? ?? ?? ?? 48 89 5C 24 68 48 89 6C 24 70",
+            "48 83 EC ?? 48 8B 05 ?? ?? ?? ?? 48 89 5C 24 ?? 48 89 6C 24 ??"
+        },
+        0
+    },
+    {
+        // CConnectionTransport WebSocket frame send — the interception point for patching outgoing
+        // CMsgClientPICSProductInfoRequest (eMsg 8903) with PICS access tokens.
+        "BBuildAndAsyncSendFrame",
+        "steamclient64.dll",
+        {
+            "48 8B C4 55 48 8D 68 A1 48 81 EC C0 00 00 00 48 89 70 18",
+            "48 8B C4 55 48 8D 68 ?? 48 81 EC ?? 00 00 00 48 89 70 ??"
+        },
+        0
+    },
 };
 
 } // namespace IceBreaker

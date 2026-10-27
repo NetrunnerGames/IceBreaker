@@ -52,6 +52,7 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
     // set_dlc(480, 520) or setdlc(...)
     std::regex addAppKeyRegex(R"(addappid\s*\(\s*(\d+)(?:\s*,\s*\d+\s*,\s*["']([a-fA-F0-9]{64})["'])?)", std::regex_constants::icase);
     std::regex dlcRegex(R"((?:set_dlc|add_dlc|setdlc)\s*\(\s*(\d+)\s*,\s*(\d+))", std::regex_constants::icase);
+    std::regex addTokenRegex(R"(addtoken\s*\(\s*(\d+)\s*,\s*["'](\d+)["']\s*\))", std::regex_constants::icase);
     std::regex rawAppRegex(R"(app(?:id)?\s*=\s*(\d+))", std::regex_constants::icase);
 
     while (std::getline(file, line)) {
@@ -66,6 +67,10 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
                     AppManager::Get().SetDepotKey(appId, keyBytes);
                 }
             }
+        } else if (std::regex_search(line, match, addTokenRegex)) {
+            uint32_t appId = std::stoul(match[1].str());
+            uint64_t token = std::stoull(match[2].str());
+            AppManager::Get().SetAccessToken(appId, token);
         } else if (std::regex_search(line, match, dlcRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t dlcId = std::stoul(match[2].str());
