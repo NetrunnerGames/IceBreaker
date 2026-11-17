@@ -765,15 +765,12 @@ void PatchEngine::ApplyInMemoryPatches() {
                                     reinterpret_cast<void**>(&oConfigStoreGetBinary),
                                     "ConfigStoreGetBinary");
         }
-        // Disabled: marking injected ids skip_flag makes Steam treat them as PICS unknown apps,
-        // which hides them from the library UI (OST keeps its copy of this hook disabled for the
-        // same reason). The PICS token injection below resolves appinfo instead, online.
-        // if (auto addr = ResolvedAddress("GetOrAddAppData")) {
-        //     HookManager::CreateHook(reinterpret_cast<void*>(addr),
-        //                             reinterpret_cast<void*>(&Hook_GetOrAddAppData),
-        //                             reinterpret_cast<void**>(&oGetOrAddAppData),
-        //                             "GetOrAddAppData");
-        // }
+        if (auto addr = ResolvedAddress("GetOrAddAppData")) {
+            HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                    reinterpret_cast<void*>(&Hook_GetOrAddAppData),
+                                    reinterpret_cast<void**>(&oGetOrAddAppData),
+                                    "GetOrAddAppData");
+        }
         if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
             HookManager::CreateHook(reinterpret_cast<void*>(addr),
                                     reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),

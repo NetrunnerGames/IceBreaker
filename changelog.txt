@@ -1,4 +1,3 @@
-[+] Restored binary-accurate AppOwnership struct layout in CheckAppOwnership hook
-[+] Set AppReleaseState to Released (4) and ensured bOwnsLicense is explicitly granted
-[+] Restored TryInitFakeLicenseOnce initialization trigger in ownership query flow
-[+] Added slash normalization and case-insensitive matching to ConfigStoreGetBinary decryption key queries
+[+] Re-enabled CAppInfoCache::GetOrAddAppData skip-flag hook to resolve pending license hangs and unblock library updates
+[+] Prevented Steam Error 56 and blocked startup when injected apps lack upstream PICS metadata
+[+] Maintained Released state on owned and unlocked packages to ensure library visibility
