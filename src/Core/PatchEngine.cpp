@@ -261,106 +261,100 @@ static bool MarkLicenseAsChangedAndProcessUpdates() {
     return true;
 }
 
-// Grows the vector through Valve's own CUtlMemory::Grow instantiation, guarded
-// by postcondition checks so a mis-resolved instantiation cannot silently
-// corrupt the package object. Only safe sizes are written afterwards.
-static bool GrowVectorRaw(CUtlVector<uint32_t>* vec, int growBy) {
-    __try {
-        oCUtlMemoryGrow(vec, growBy);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool TryGrowVector(CUtlVector<uint32_t>* vec, int growBy) {
-    if (!oCUtlMemoryGrow || growBy <= 0) return false;
-    const uint32_t oldAlloc = vec->m_Memory.m_nAllocationCount;
-    const uint32_t oldSize = vec->m_Size;
-
-    if (!GrowVectorRaw(vec, growBy)) {
-        HookManager::Log("LicenseInjection: caught exception growing AppId vector");
-        return false;
-    }
-
-    // Postconditions: allocation must now cover oldSize+growBy elements and the
-    // caller-owned size field must be untouched by the memory-layer grow.
-    if (vec->m_Memory.m_nAllocationCount < oldSize + static_cast<uint32_t>(growBy)) {
-        HookManager::Log("LicenseInjection: post-grow allocation unexpected (" +
-                         std::to_string(oldAlloc) + " -> " +
-                         std::to_string(vec->m_Memory.m_nAllocationCount) + "); refusing to write");
-        return false;
-    }
-    if (vec->m_Size != oldSize) {
-        HookManager::Log("LicenseInjection: grow changed vector size unexpectedly; refusing to write");
-        return false;
-    }
-    return true;
-}
-
 // ── single-owner license maintenance ─────────────────────────────────
 // ALL package-state mutation happens here, always on the thread that invoked
 // Hook_CheckAppOwnership (Steam's own license/ownership evaluation thread),
 // after the original call has returned. Background threads (IPC RELOAD, file
 // watcher, DataJackUI) only raise the request flag — never touch Valve state.
+//
+// STABILITY RULES learned from crash forensics:
+//  * One-shot: the license vector is populated exactly once per process; later
+//    Notify requests are ignored until restart. Repeated appends race Steam's
+//    own multithreaded license pipeline and corrupt the heap.
+//  * Capacity-only: we never grow Valve's vector ourselves. Steam grows it as
+//    it processes licenses (observed directly in dumps); we write into spare
+//    capacity that exists at that moment, and defer the rest.
+
+// Raw SEH fence without C++ objects (C2712) around the whole maintenance flow.
+static bool MaintenanceFence(void* pCPackageInfo, void* pCUser);
+
 static void ConsumeLicenseMaintenance() {
     std::lock_guard<std::mutex> lock(g_licenseMutex);
     if (!g_pCPackageInfo || !oGetPackageInfo || !g_pCUser) return;
 
-    PackageInfo* pPkg = oGetPackageInfo(g_pCPackageInfo, kInjectedPackageId, kInjectedPkgAccessToken);
+    if (!MaintenanceFence(g_pCPackageInfo, g_pCUser)) {
+        HookManager::Log("LicenseInjection: exception inside license maintenance; injection aborted this session");
+    }
+    g_licenseInitialized = true;
+    g_licenseChangeRequested.store(false);
+}
+
+static bool MaintenanceBody(void* pCPackageInfo) {
+    PackageInfo* pPkg = oGetPackageInfo(pCPackageInfo, kInjectedPackageId, kInjectedPkgAccessToken);
     if (!pPkg) {
         static bool warnedOnce = false;
         if (!warnedOnce) {
             HookManager::Log("LicenseInjection: GetPackageInfo returned null for package 0");
             warnedOnce = true;
         }
-        return;
+        return true; // transient: keep the request pending
     }
     if (!g_pInjectedPackageInfo) g_pInjectedPackageInfo = pPkg;
 
     if (!ValidatePackageInfo(pPkg)) {
-        // Do not poison a session with writes into an object we cannot trust.
         HookManager::Log("LicenseInjection: package object failed sanity validation; injection disabled for this session");
-        g_licenseChangeRequested.store(false);
-        g_licenseInitialized = true; // stop retrying every ownership check
-        return;
+        return true;
+    }
+
+    static bool injectedOnce = false;
+    if (injectedOnce) {
+        return true; // steady state — one-shot policy
     }
 
     std::vector<uint32_t> appIds;
     AppManager::Get().GetUnlockedApps(appIds);
 
-    // Count how many are genuinely missing before writing anything.
-    uint32_t missing = 0;
+    auto& vec = pPkg->AppIdVec;
+    const int64_t spareNow = static_cast<int64_t>(vec.m_Memory.m_nAllocationCount) - vec.m_Size;
+    const int64_t usableSpare = spareNow > 0 ? spareNow : 0;
+
+    uint32_t missingTotal = 0;
     for (uint32_t id : appIds) {
         bool exists = false;
-        auto& vec = pPkg->AppIdVec;
         for (uint32_t i = 0; i < vec.m_Size; ++i)
             if (vec.m_Memory.m_pMemory[i] == id) { exists = true; break; }
-        if (!exists) ++missing;
+        if (!exists) ++missingTotal;
     }
 
-    if (missing > 0) {
-        // Grow once up-front (through the validated Valve instantiation) so all
-        // pending ids fit, then append within confirmed capacity.
-        auto& vec = pPkg->AppIdVec;
-        const int64_t spare = static_cast<int64_t>(vec.m_Memory.m_nAllocationCount) - vec.m_Size;
-        if (spare < static_cast<int64_t>(missing)) {
-            TryGrowVector(&vec, static_cast<int>(missing - spare));
-        }
-        uint32_t written = AppendAppIds(pPkg, appIds);
-        HookManager::Log("LicenseInjection: appended " + std::to_string(written) + "/" +
-                         std::to_string(missing) + " requested ids to package " +
-                         std::to_string(kInjectedPackageId) +
-                         " (vector " + std::to_string(vec.m_Size) + "/" +
-                         std::to_string(vec.m_Memory.m_nAllocationCount) + ")");
-        if (written > 0) {
-            MarkLicenseAsChangedAndProcessUpdates();
-        }
-    } else if (!g_licenseInitialized) {
-        HookManager::Log("LicenseInjection: no pending ids to inject at init; entering steady state");
+    if (missingTotal == 0) {
+        HookManager::Log("LicenseInjection: nothing to inject; entering steady state");
+        return true;
     }
-    g_licenseInitialized = true;
-    g_licenseChangeRequested.store(false);
+
+    // Safe mode does not grow Valve's vector (concurrent license processing owns
+    // that); we write into spare capacity only and defer the remainder.
+    uint32_t written = AppendAppIds(pPkg, appIds);
+    if (written < missingTotal) {
+        HookManager::Log("LicenseInjection: deferred " +
+                         std::to_string(missingTotal - written) + " ids (safe mode: no growth; " +
+                         std::to_string(usableSpare) + " slots were spare)");
+    } else {
+        HookManager::Log("LicenseInjection: appended all " + std::to_string(written) +
+                         " requested ids to package " + std::to_string(kInjectedPackageId));
+    }
+    injectedOnce = true;
+    if (written > 0) {
+        MarkLicenseAsChangedAndProcessUpdates();
+    }
+    return true;
+}
+
+static bool MaintenanceFence(void* pCPackageInfo, void* /*pCUser*/) {
+    __try {
+        return MaintenanceBody(pCPackageInfo);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 void PatchEngine::NotifyLicenseChanged() {
@@ -910,10 +904,21 @@ void PatchEngine::ApplyInMemoryPatches() {
             }
         }
         if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
-                                    reinterpret_cast<void**>(&oBBuildAndAsyncSendFrame),
-                                    "BBuildAndAsyncSendFrame");
+            // OPT-IN while stabilizing: the PICS access-token patcher re-encodes
+            // live IPC transport packets during login; its frame layout for this
+            // build is not independently verified yet. Enable the token rewrite
+            // with ICEBREAKER_FULL=1 only after a clean safe-mode boot.
+            wchar_t flag[8] = {};
+            bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_FULL", flag, 8) > 0 &&
+                           (flag[0] == L'1' || flag[0] == L'y');
+            if (!enabled) {
+                HookManager::Log("BBuildAndAsyncSendFrame: resolved but PICS rewrite disabled by default (set ICEBREAKER_FULL=1 to enable)");
+            } else {
+                HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                        reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
+                                        reinterpret_cast<void**>(&oBBuildAndAsyncSendFrame),
+                                        "BBuildAndAsyncSendFrame");
+            }
         }
         if (auto addr = ResolvedAddress("MarkLicenseAsChanged")) {
             oMarkLicenseAsChanged = reinterpret_cast<pfnMarkLicenseAsChanged_t>(addr);
