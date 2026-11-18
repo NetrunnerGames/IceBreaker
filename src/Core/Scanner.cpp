@@ -48,6 +48,26 @@ uintptr_t Scanner::Scan(uintptr_t start, size_t length, const std::string& patte
     return 0;
 }
 
+size_t Scanner::CountMatches(HMODULE module, const std::string& pattern) {
+    if (!module) return 0;
+    size_t count = 0;
+    for (const auto& [base, size] : ExecutableRanges(module)) {
+        std::vector<int> pb = ParsePattern(pattern);
+        if (pb.empty() || size < pb.size()) continue;
+
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(base);
+        for (size_t i = 0; i + pb.size() <= size; ++i) {
+            bool ok = true;
+            for (size_t j = 0; j < pb.size(); ++j) {
+                if (pb[j] != -1 && p[i + j] != static_cast<uint8_t>(pb[j])) { ok = false; break; }
+            }
+            if (ok) { ++count; i += pb.size() - 1; }
+            if (count >= 64) return count; // safety cap
+        }
+    }
+    return count;
+}
+
 uintptr_t Scanner::ScanModule(HMODULE module, const std::string& pattern) {
     if (!module) return 0;
     for (const auto& [base, size] : ExecutableRanges(module)) {

@@ -57,8 +57,9 @@ inline const std::vector<PatternDefinition> g_SteamClientPatterns = {
         "ProcessPendingLicenseUpdates",
         "steamclient64.dll",
         {
-            "41 56 41 57 48 83 EC 38 83 B9 ?? ?? 00 00 00",
-            "41 56 41 57 48 83 EC ?? 83 B9 ?? ?? 00 00 00"
+            "41 56 41 57 48 83 EC 40 83 B9 ?? 24 00 00 00 B8",
+            "41 56 41 57 48 83 EC ?? 83 B9 ?? 24 00 00 00 B8",
+            "41 56 41 57 48 83 EC 38 83 B9 ?? 24 00 00 00 B8"
         },
         0
     },

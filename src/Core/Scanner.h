@@ -16,6 +16,9 @@ public:
 
     // Fast masked scan restricted to the module's executable sections (ScanModule).
     static uintptr_t ScanModule(HMODULE module, const std::string& pattern);
+
+    // Number of distinct matches across the module's executable sections (max ~first N).
+    static size_t CountMatches(HMODULE module, const std::string& pattern);
     static std::vector<std::pair<uintptr_t, size_t>> ExecutableRanges(HMODULE module);
 
     // Scans a specific memory range

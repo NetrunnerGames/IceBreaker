@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <vector>
 #include <cstring>
+#include <atomic>
+#include <mutex>
 
 namespace IceBreaker {
 
@@ -169,6 +171,13 @@ struct PackageInfo {
     CUtlVector<uint32_t> DepotIdVec;
 };
 
+enum EPackageStatus : uint32_t {
+    PackageStatus_Available = 0,
+    PackageStatus_Preorder = 1,
+    PackageStatus_Unavailable = 2,
+    PackageStatus_Invalid = 3,
+};
+
 // ── steamclient64: function pointers for package manipulation ──────────────────
 typedef void* (*pfnCUtlMemoryGrow_t)(void* pVec, int grow_size);
 typedef int64_t (*pfnMarkLicenseAsChanged_t)(void* pCUser, uint32_t packageId, bool bChanged);
@@ -184,91 +193,180 @@ static void* g_pCPackageInfo = nullptr;
 static void* g_pCUser = nullptr;
 static PackageInfo* g_pInjectedPackageInfo = nullptr;
 static bool g_licenseInitialized = false;
-static bool g_licenseRefreshPending = false;
+static std::atomic<bool> g_licenseChangeRequested{ false };
+static std::mutex g_licenseMutex;
+
+// Defensive validation before touching Valve's package state: if the struct
+// layout has drifted or the object looks wrong, refuse to write anything
+// (a bad write here corrupts pointer tables and crashes the client later,
+// historically as an execute-at-garbage AV during "Loading user data").
+static bool ValidatePackageInfo(const PackageInfo* pPkg) {
+    if (!pPkg) return false;
+    if (pPkg->Status > PackageStatus_Invalid) return false;
+    const auto& v = pPkg->AppIdVec;
+    if (v.m_Size > v.m_Memory.m_nAllocationCount) return false;
+    if (v.m_Memory.m_nAllocationCount > 0x100000u) return false;
+    for (uint32_t i = 0; i < v.m_Size && i < 64; ++i) {
+        uint32_t id = v.m_Memory.m_pMemory[i];
+        if (id == 0 || id == 0xFFFFFFFFu) return false;
+    }
+    return true;
+}
+
+// Appends ids to the license vector only when spare capacity allows. Returns the
+// number of ids actually written.
+static uint32_t AppendAppIds(PackageInfo* pPkg, const std::vector<uint32_t>& wanted) {
+    auto& vec = pPkg->AppIdVec;
+    uint32_t written = 0;
+    for (uint32_t id : wanted) {
+        bool exists = false;
+        for (uint32_t i = 0; i < vec.m_Size; ++i)
+            if (vec.m_Memory.m_pMemory[i] == id) { exists = true; break; }
+        if (exists) continue;
+        if (vec.m_Size >= vec.m_Memory.m_nAllocationCount) {
+            HookManager::Log("LicenseInjection: vector at capacity (" +
+                             std::to_string(vec.m_Size) + "/" +
+                             std::to_string(vec.m_Memory.m_nAllocationCount) +
+                             "), deferring remaining ids");
+            break;
+        }
+        vec.m_Memory.m_pMemory[vec.m_Size++] = id;
+        ++written;
+    }
+    return written;
+}
 
 constexpr uint32_t kInjectedPackageId = 0;
 constexpr uint64_t kInjectedPkgAccessToken = 10660652434190618804ull;
+
+static bool SafeInvokeLicenseUpdates(void* pCUser, pfnMarkLicenseAsChanged_t fnMark, pfnProcessPendingLicenseUpdates_t fnProcess, uint32_t pkgId) {
+    __try {
+        fnMark(pCUser, pkgId, true);
+        fnProcess(pCUser);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 static bool MarkLicenseAsChangedAndProcessUpdates() {
     if (!g_pCUser || !oMarkLicenseAsChanged || !oProcessPendingLicenseUpdates) {
         return false;
     }
-    oMarkLicenseAsChanged(g_pCUser, kInjectedPackageId, true);
-    oProcessPendingLicenseUpdates(g_pCUser);
+    if (!SafeInvokeLicenseUpdates(g_pCUser, oMarkLicenseAsChanged, oProcessPendingLicenseUpdates, kInjectedPackageId)) {
+        HookManager::Log("MarkLicenseAsChanged: caught exception invoking license update routines; continuing safely");
+        return false;
+    }
     HookManager::Log("MarkLicenseAsChanged: updated package " + std::to_string(kInjectedPackageId));
     return true;
 }
 
-static bool InitFakeLicenseOnce(PackageInfo* pPkg) {
-    if (pPkg->Status != 0) { // EPackageStatus::Available == 0
-        HookManager::Log("InitFakeLicenseOnce: package status is not Available (" + std::to_string(pPkg->Status) + ")");
+// Grows the vector through Valve's own CUtlMemory::Grow instantiation, guarded
+// by postcondition checks so a mis-resolved instantiation cannot silently
+// corrupt the package object. Only safe sizes are written afterwards.
+static bool GrowVectorRaw(CUtlVector<uint32_t>* vec, int growBy) {
+    __try {
+        oCUtlMemoryGrow(vec, growBy);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool TryGrowVector(CUtlVector<uint32_t>* vec, int growBy) {
+    if (!oCUtlMemoryGrow || growBy <= 0) return false;
+    const uint32_t oldAlloc = vec->m_Memory.m_nAllocationCount;
+    const uint32_t oldSize = vec->m_Size;
+
+    if (!GrowVectorRaw(vec, growBy)) {
+        HookManager::Log("LicenseInjection: caught exception growing AppId vector");
         return false;
     }
 
-    std::vector<uint32_t> appIds;
-    AppManager::Get().GetUnlockedApps(appIds);
-    if (!appIds.empty() && oCUtlMemoryGrow) {
-        uint32_t oldSize = pPkg->AppIdVec.m_Size;
-        uint32_t numToAdd = static_cast<uint32_t>(appIds.size());
-        oCUtlMemoryGrow(&pPkg->AppIdVec, numToAdd);
-        for (uint32_t i = 0; i < numToAdd; ++i) {
-            pPkg->AppIdVec.m_Memory.m_pMemory[oldSize + i] = appIds[i];
-        }
-        HookManager::Log("InitFakeLicense: injected " + std::to_string(numToAdd) + " apps into Package 0");
+    // Postconditions: allocation must now cover oldSize+growBy elements and the
+    // caller-owned size field must be untouched by the memory-layer grow.
+    if (vec->m_Memory.m_nAllocationCount < oldSize + static_cast<uint32_t>(growBy)) {
+        HookManager::Log("LicenseInjection: post-grow allocation unexpected (" +
+                         std::to_string(oldAlloc) + " -> " +
+                         std::to_string(vec->m_Memory.m_nAllocationCount) + "); refusing to write");
+        return false;
     }
-
-    g_licenseInitialized = true;
-    g_licenseRefreshPending = true;
-    if (MarkLicenseAsChangedAndProcessUpdates()) {
-        g_licenseRefreshPending = false;
+    if (vec->m_Size != oldSize) {
+        HookManager::Log("LicenseInjection: grow changed vector size unexpectedly; refusing to write");
+        return false;
     }
     return true;
 }
 
-static bool TryInitFakeLicenseOnce() {
-    if (g_licenseInitialized) return true;
-    if (g_pCPackageInfo && oGetPackageInfo) {
-        PackageInfo* pPkg = oGetPackageInfo(g_pCPackageInfo, kInjectedPackageId, kInjectedPkgAccessToken);
-        if (!pPkg) {
-            HookManager::Log("TryInitFakeLicenseOnce: GetPackageInfo returned null for package 0");
-            return false;
-        }
-        if (!g_pInjectedPackageInfo) g_pInjectedPackageInfo = pPkg;
-        return InitFakeLicenseOnce(pPkg);
-    }
-    return false;
-}
+// ── single-owner license maintenance ─────────────────────────────────
+// ALL package-state mutation happens here, always on the thread that invoked
+// Hook_CheckAppOwnership (Steam's own license/ownership evaluation thread),
+// after the original call has returned. Background threads (IPC RELOAD, file
+// watcher, DataJackUI) only raise the request flag — never touch Valve state.
+static void ConsumeLicenseMaintenance() {
+    std::lock_guard<std::mutex> lock(g_licenseMutex);
+    if (!g_pCPackageInfo || !oGetPackageInfo || !g_pCUser) return;
 
-void PatchEngine::NotifyLicenseChanged() {
-    PackageInfo* pPkg = g_pInjectedPackageInfo;
-    if (!pPkg || !oCUtlMemoryGrow) return;
+    PackageInfo* pPkg = oGetPackageInfo(g_pCPackageInfo, kInjectedPackageId, kInjectedPkgAccessToken);
+    if (!pPkg) {
+        static bool warnedOnce = false;
+        if (!warnedOnce) {
+            HookManager::Log("LicenseInjection: GetPackageInfo returned null for package 0");
+            warnedOnce = true;
+        }
+        return;
+    }
+    if (!g_pInjectedPackageInfo) g_pInjectedPackageInfo = pPkg;
+
+    if (!ValidatePackageInfo(pPkg)) {
+        // Do not poison a session with writes into an object we cannot trust.
+        HookManager::Log("LicenseInjection: package object failed sanity validation; injection disabled for this session");
+        g_licenseChangeRequested.store(false);
+        g_licenseInitialized = true; // stop retrying every ownership check
+        return;
+    }
 
     std::vector<uint32_t> appIds;
     AppManager::Get().GetUnlockedApps(appIds);
-    if (appIds.empty()) return;
 
-    // Fast-append missing appIds
-    std::unordered_set<uint32_t> existing;
-    for (uint32_t i = 0; i < pPkg->AppIdVec.m_Size; ++i) {
-        existing.insert(pPkg->AppIdVec.m_Memory.m_pMemory[i]);
-    }
-
-    std::vector<uint32_t> toAdd;
+    // Count how many are genuinely missing before writing anything.
+    uint32_t missing = 0;
     for (uint32_t id : appIds) {
-        if (!existing.count(id)) toAdd.push_back(id);
+        bool exists = false;
+        auto& vec = pPkg->AppIdVec;
+        for (uint32_t i = 0; i < vec.m_Size; ++i)
+            if (vec.m_Memory.m_pMemory[i] == id) { exists = true; break; }
+        if (!exists) ++missing;
     }
 
-    if (!toAdd.empty()) {
-        uint32_t oldSize = pPkg->AppIdVec.m_Size;
-        uint32_t numToAdd = static_cast<uint32_t>(toAdd.size());
-        oCUtlMemoryGrow(&pPkg->AppIdVec, numToAdd);
-        for (uint32_t i = 0; i < numToAdd; ++i) {
-            pPkg->AppIdVec.m_Memory.m_pMemory[oldSize + i] = toAdd[i];
+    if (missing > 0) {
+        // Grow once up-front (through the validated Valve instantiation) so all
+        // pending ids fit, then append within confirmed capacity.
+        auto& vec = pPkg->AppIdVec;
+        const int64_t spare = static_cast<int64_t>(vec.m_Memory.m_nAllocationCount) - vec.m_Size;
+        if (spare < static_cast<int64_t>(missing)) {
+            TryGrowVector(&vec, static_cast<int>(missing - spare));
         }
-        HookManager::Log("NotifyLicenseChanged: added " + std::to_string(numToAdd) + " apps to Package 0");
+        uint32_t written = AppendAppIds(pPkg, appIds);
+        HookManager::Log("LicenseInjection: appended " + std::to_string(written) + "/" +
+                         std::to_string(missing) + " requested ids to package " +
+                         std::to_string(kInjectedPackageId) +
+                         " (vector " + std::to_string(vec.m_Size) + "/" +
+                         std::to_string(vec.m_Memory.m_nAllocationCount) + ")");
+        if (written > 0) {
+            MarkLicenseAsChangedAndProcessUpdates();
+        }
+    } else if (!g_licenseInitialized) {
+        HookManager::Log("LicenseInjection: no pending ids to inject at init; entering steady state");
     }
+    g_licenseInitialized = true;
+    g_licenseChangeRequested.store(false);
+}
 
-    MarkLicenseAsChangedAndProcessUpdates();
+void PatchEngine::NotifyLicenseChanged() {
+    // Safe from any thread: only raises the request; the actual mutation runs
+    // inside Hook_CheckAppOwnership on Steam's own thread.
+    g_licenseChangeRequested.store(true);
 }
 
 // ── steamclient64: CheckAppOwnership hook ─────────────────────────────
@@ -312,14 +410,15 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
     if (!g_pCUser) {
         g_pCUser = pThis;
         HookManager::Log("CheckAppOwnership: captured CUser");
-        if (g_licenseRefreshPending) {
-            MarkLicenseAsChangedAndProcessUpdates();
-            g_licenseRefreshPending = false;
-        }
     }
 
     bool result = oCheckAppOwnership ? oCheckAppOwnership(pThis, appId, pOwn) : false;
-    TryInitFakeLicenseOnce();
+
+    // Single-owner rule: package mutation only happens here (Steam's thread,
+    // after the original call has fully returned) when a change was requested.
+    if (g_licenseChangeRequested.load(std::memory_order_acquire) || !g_licenseInitialized) {
+        ConsumeLicenseMaintenance();
+    }
 
     // Genuinely owned via real licenses (present in more than one actual package): leave Steam's
     // answer alone but keep the app marked Released so the library still lists it (OST parity).
@@ -354,7 +453,10 @@ static PackageInfo* Hook_GetPackageInfo(void* pThis, uint32_t packageId, uint64_
     if (!g_pCPackageInfo) {
         g_pCPackageInfo = pThis;
         HookManager::Log("GetPackageInfo: captured CPackageInfo");
-        TryInitFakeLicenseOnce();
+        // NOTE: no license mutation here — mutating package state from inside a
+        // GetPackageInfo call reenters Valve's locked store mid-update and has
+        // crashed the client during "Loading user data". Injection is driven
+        // exclusively from Hook_CheckAppOwnership (Steam's own thread).
     }
     return oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
 }
@@ -677,6 +779,21 @@ static bool Hook_ShouldShowAppInLibrary(void* pThis, uint32_t appId) {
     return true;
 }
 
+// Names whose address gets DETOURed. For these the match must be unique across
+// the executable sections — a generic-prologue multi-match silently hooks an
+// unrelated function (the corruption class behind past "Loading user data"
+// crashes). Resolver-only names (function pointers we merely call) may keep
+// first-match semantics.
+static bool IsHookedName(const char* name) {
+    static const char* kHooked[] = {
+        "ShouldShowAppInLibrary", "CheckAppOwnership", "GetPackageInfo",
+        "ConfigStoreGetBinary",   "GetOrAddAppData",   "BBuildAndAsyncSendFrame",
+    };
+    for (const char* n : kHooked)
+        if (strcmp(n, name) == 0) return true;
+    return false;
+}
+
 // ── resolution bookkeeping ────────────────────────────────────────────
 static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* tag,
                     const std::unordered_map<std::string, std::vector<std::string>>& otaPatterns) {
@@ -686,6 +803,15 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
     for (const auto& sig : pat.patterns) {
         uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), sig);
         if (addr) {
+            if (IsHookedName(pat.name)) {
+                size_t hits = Scanner::CountMatches(reinterpret_cast<HMODULE>(base), sig);
+                if (hits != 1) {
+                    HookManager::Log(std::string(tag) + ": " + pat.name +
+                                     " matched " + std::to_string(hits) +
+                                     " locations — ambiguous, hook skipped (non-fatal)");
+                    return;
+                }
+            }
             PatchEngine::CacheResolved(pat.name, addr);
             HookManager::Log(std::string(tag) + ": found " + pat.name + " at " + Hex(addr));
             return;
@@ -766,10 +892,22 @@ void PatchEngine::ApplyInMemoryPatches() {
                                     "ConfigStoreGetBinary");
         }
         if (auto addr = ResolvedAddress("GetOrAddAppData")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_GetOrAddAppData),
-                                    reinterpret_cast<void**>(&oGetOrAddAppData),
-                                    "GetOrAddAppData");
+            // OPT-IN ONLY: the current signature is ambiguous (generic prologue),
+            // so an unknown function could be hooked and its return misused as a
+            // CAppInfoCache entry — one of the corruption sources behind the
+            // "Loading user data" crashes. Enable with ICEBREAKER_APPDATA_HOOK=1
+            // only while actively debugging the anchor.
+            wchar_t flag[8] = {};
+            bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_APPDATA_HOOK", flag, 8) > 0 &&
+                           (flag[0] == L'1' || flag[0] == L'y');
+            if (!enabled) {
+                HookManager::Log("GetOrAddAppData: resolved but hook disabled by default (ambiguous signature; set ICEBREAKER_APPDATA_HOOK=1 to enable)");
+            } else {
+                HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                        reinterpret_cast<void*>(&Hook_GetOrAddAppData),
+                                        reinterpret_cast<void**>(&oGetOrAddAppData),
+                                        "GetOrAddAppData");
+            }
         }
         if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
             HookManager::CreateHook(reinterpret_cast<void*>(addr),
