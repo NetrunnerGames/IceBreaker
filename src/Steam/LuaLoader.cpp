@@ -110,7 +110,10 @@ void LuaLoader::ReloadAll() {
     HookManager::Log("Reloaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
                      std::to_string(AppManager::Get().GetUnlockedCount()));
 
-    PatchEngine::NotifyLicenseChanged();
+    // Sanitize any previously failed download states (e.g. UpdateResult 6 / StateFlags 6)
+    PatchEngine::SanitizeAllUnlockedDownloadStates();
+
+    PatchEngine::NotifyLicenseChanged(true);
 }
 
 bool LuaLoader::LoadPluginManifests() {

@@ -25,7 +25,12 @@ public:
     static uintptr_t UIBase();
 
     /// Notifies Steam that the fake license (Package 0) has changed and flushes pending updates.
-    static void NotifyLicenseChanged();
+    static void NotifyLicenseChanged(bool forceRescan = false);
+
+    /// Checks for and repairs stale/error states in appmanifest_<appId>.acf and downloading/<appId>
+    static void SanitizeAppDownloadState(uint32_t appId);
+    /// Cleans download state for all currently unlocked apps.
+    static void SanitizeAllUnlockedDownloadStates();
 
     /// Returns the active user's 32-bit Steam AccountID from Steam config / userdata.
     static uint32_t GetActiveAccountID();

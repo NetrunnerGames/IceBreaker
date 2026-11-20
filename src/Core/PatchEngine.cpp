@@ -197,6 +197,123 @@ static std::atomic<bool> g_licenseChangeRequested{ false };
 static std::mutex g_licenseMutex;
 static std::atomic<int> g_maintenanceAttempts{ 0 };
 static bool g_licenseDone = false;
+static std::atomic<bool> g_licenseForceReset{ false };
+
+// ── App Download State Sanitizer ──────────────────────────────────────────
+// When an app download fails while IceBreaker was not hooked or missing a key,
+// Steam writes UpdateResult 6 ("No connection" / Access Denied) and StateFlags 6
+// into appmanifest_<appId>.acf, and creates a dead-locked downloading/<appId> folder.
+// Even after fixing IceBreaker, Steam locks that app in an exponential backoff error state.
+// This function resets the ACF error flags back to 4 (clean state) and cleans empty
+// staging residue so Steam immediately requests fresh tokens and downloads normally.
+static std::wstring GetSteamRootPath() {
+    wchar_t exePath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        return path.substr(0, lastSlash);
+    }
+    return L"";
+}
+
+void PatchEngine::SanitizeAppDownloadState(uint32_t appId) {
+    if (appId == 0) return;
+    std::wstring steamRoot = GetSteamRootPath();
+    if (steamRoot.empty()) return;
+
+    std::wstring manifestPath = steamRoot + L"\\steamapps\\appmanifest_" + std::to_wstring(appId) + L".acf";
+    std::wstring downloadingDir = steamRoot + L"\\steamapps\\downloading\\" + std::to_wstring(appId);
+
+    // 1. Check if appmanifest exists and has UpdateResult / StateFlags error
+    HANDLE hFile = CreateFileW(manifestPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD size = GetFileSize(hFile, nullptr);
+        if (size > 0 && size < 64 * 1024) { // typical ACF is ~1-2 KB
+            std::string content(size, '\0');
+            DWORD bytesRead = 0;
+            if (ReadFile(hFile, &content[0], size, &bytesRead, nullptr)) {
+                bool modified = false;
+
+                // Reset UpdateResult "6" (or non-zero error) to "0"
+                size_t urPos = content.find("\"UpdateResult\"");
+                if (urPos != std::string::npos) {
+                    size_t quote1 = content.find('"', urPos + 14);
+                    if (quote1 != std::string::npos) {
+                        size_t quote2 = content.find('"', quote1 + 1);
+                        if (quote2 != std::string::npos) {
+                            std::string currentVal = content.substr(quote1 + 1, quote2 - quote1 - 1);
+                            if (currentVal == "6" || currentVal == "1" || currentVal == "2") {
+                                content.replace(quote1 + 1, quote2 - quote1 - 1, "0");
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+
+                // If BytesDownloaded is 0 and StateFlags is 6 (error/update required), reset to 4 (Fully Installed)
+                size_t bytesDownPos = content.find("\"BytesDownloaded\"\t\t\"0\"");
+                if (bytesDownPos == std::string::npos) {
+                    bytesDownPos = content.find("\"BytesDownloaded\" \"0\"");
+                }
+                if (bytesDownPos != std::string::npos) {
+                    size_t sfPos = content.find("\"StateFlags\"");
+                    if (sfPos != std::string::npos) {
+                        size_t q1 = content.find('"', sfPos + 12);
+                        if (q1 != std::string::npos) {
+                            size_t q2 = content.find('"', q1 + 1);
+                            if (q2 != std::string::npos) {
+                                std::string sfVal = content.substr(q1 + 1, q2 - q1 - 1);
+                                if (sfVal == "6" || sfVal == "1026" || sfVal == "1030") {
+                                    content.replace(q1 + 1, q2 - q1 - 1, "4");
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (modified) {
+                    SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+                    DWORD bytesWritten = 0;
+                    WriteFile(hFile, content.c_str(), static_cast<DWORD>(content.size()), &bytesWritten, nullptr);
+                    SetEndOfFile(hFile);
+                    HookManager::Log("SanitizeAppDownloadState: purged stale error StateFlags/UpdateResult in appmanifest_" +
+                                     std::to_string(appId) + ".acf");
+                }
+            }
+        }
+        CloseHandle(hFile);
+    }
+
+    // 2. Clean empty downloading folder if 0 bytes
+    WIN32_FIND_DATAW fd;
+    std::wstring searchPattern = downloadingDir + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+    bool hasFiles = false;
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                hasFiles = true;
+                break;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    if (!hasFiles && GetFileAttributesW(downloadingDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        RemoveDirectoryW(downloadingDir.c_str());
+    }
+}
+
+void PatchEngine::SanitizeAllUnlockedDownloadStates() {
+    std::vector<uint32_t> apps;
+    AppManager::Get().GetUnlockedApps(apps);
+    for (uint32_t appId : apps) {
+        SanitizeAppDownloadState(appId);
+    }
+}
 
 // Defensive validation before touching Valve's package state: if the struct
 // layout has drifted or the object looks wrong, refuse to write anything
@@ -339,6 +456,10 @@ static bool MaintenanceBody(void* pCPackageInfo) {
     //   A) alloc >= oldSize+growBy && size == oldSize  -> append via m_Size++
     //   B) size == oldSize+growBy && alloc >= size     -> fill [oldSize..size)
     static bool injectedOnce = false;
+    if (g_licenseForceReset.exchange(false)) {
+        injectedOnce = false;
+        g_licenseDone = false;
+    }
     if (injectedOnce) {
         g_licenseDone = true; // steady state — one-shot policy
         return true;
@@ -442,9 +563,13 @@ static bool MaintenanceFence(void* pCPackageInfo, void* /*pCUser*/) {
     }
 }
 
-void PatchEngine::NotifyLicenseChanged() {
+void PatchEngine::NotifyLicenseChanged(bool forceRescan) {
     // Safe from any thread: only raises the request; the actual mutation runs
     // inside Hook_CheckAppOwnership on Steam's own thread.
+    if (forceRescan) {
+        g_licenseForceReset.store(true);
+        g_licenseDone = false;
+    }
     g_licenseChangeRequested.store(true);
 }
 

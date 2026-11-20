@@ -1,5 +1,6 @@
 #include "IpcServer.h"
 #include "../Core/HookManager.h"
+#include "../Core/PatchEngine.h"
 #include "../Steam/AppManager.h"
 #include "../Steam/LuaLoader.h"
 #include <windows.h>
@@ -52,6 +53,19 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
     if (cmd == "RELOAD") {
         LuaLoader::ReloadAll();
         return "OK reloaded\n";
+    }
+    if (cmd.rfind("RETRY_APP ", 0) == 0 || cmd.rfind("SANITIZE ", 0) == 0) {
+        size_t offset = (cmd.rfind("RETRY_APP ", 0) == 0) ? 10 : 9;
+        std::string arg = cmd.substr(offset);
+        try {
+            uint32_t appId = std::stoul(arg);
+            PatchEngine::SanitizeAppDownloadState(appId);
+            PatchEngine::NotifyLicenseChanged(true);
+            HookManager::Log("IPC: sanitized download state and re-armed license for appId " + std::to_string(appId));
+            return "OK retried " + std::to_string(appId) + "\n";
+        } catch (...) {
+            return "ERROR: invalid appId\n";
+        }
     }
     if (cmd.rfind("UNLOCK ", 0) == 0) {
         std::string arg = cmd.substr(7);
