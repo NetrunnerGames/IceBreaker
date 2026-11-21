@@ -419,8 +419,10 @@ static void ConsumeLicenseMaintenance() {
     g_maintenanceAttempts.fetch_add(1);
 
     if (!MaintenanceFence(g_pCPackageInfo, g_pCUser)) {
-        HookManager::Log("LicenseInjection: exception inside license maintenance; will retry");
-        // keep g_licenseChangeRequested set so the next ownership check retries
+        HookManager::Log("LicenseInjection: exception inside license maintenance; steady state entered to protect UI");
+        g_licenseDone = true;
+        g_licenseInitialized = true;
+        g_licenseChangeRequested.store(false);
     } else if (g_licenseDone) {
         g_licenseChangeRequested.store(false);
         g_licenseInitialized = true;
@@ -544,7 +546,7 @@ static bool MaintenanceBody(void* pCPackageInfo) {
             HookManager::Log("MarkLicenseAsChanged: updated package " +
                              std::to_string(kInjectedPackageId));
         }
-        if (oProcessPendingLicenseUpdates && g_pCUser) {
+        if (fullMode && oProcessPendingLicenseUpdates && g_pCUser) {
             if (ProcessPendingRaw(g_pCUser)) {
                 HookManager::Log("ProcessPendingLicenseUpdates: invoked");
             } else {
