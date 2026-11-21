@@ -544,7 +544,7 @@ static bool MaintenanceBody(void* pCPackageInfo) {
             HookManager::Log("MarkLicenseAsChanged: updated package " +
                              std::to_string(kInjectedPackageId));
         }
-        if (fullMode && oProcessPendingLicenseUpdates && g_pCUser) {
+        if (oProcessPendingLicenseUpdates && g_pCUser) {
             if (ProcessPendingRaw(g_pCUser)) {
                 HookManager::Log("ProcessPendingLicenseUpdates: invoked");
             } else {
