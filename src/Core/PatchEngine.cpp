@@ -386,6 +386,11 @@ static bool GrowVectorRaw(CUtlVector<uint32_t>* vec, int growBy) {
     }
 }
 
+// ── Dynamic synthetic package cache for Multi-Package architecture (Solution A)
+static std::mutex g_virtualPkgMutex;
+static std::unordered_map<uint32_t, PackageInfo> g_virtualPackages;
+static std::unordered_map<uint32_t, std::vector<uint32_t>> g_virtualPkgAppStorage;
+
 // ── single-owner license maintenance ─────────────────────────────────
 // ALL package-state mutation happens here, always on the thread that invoked
 // Hook_CheckAppOwnership (Steam's own license/ownership evaluation thread),
@@ -571,6 +576,9 @@ void PatchEngine::NotifyLicenseChanged(bool forceRescan) {
     if (forceRescan) {
         g_licenseForceReset.store(true);
         g_licenseDone = false;
+        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
+        g_virtualPackages.clear();
+        g_virtualPkgAppStorage.clear();
     }
     g_licenseChangeRequested.store(true);
 }
@@ -636,7 +644,8 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
 
     if (AppManager::Get().IsAppUnlocked(appId) && !AppManager::Get().IsMarkedOwned(appId)) {
         if (pOwn) {
-            pOwn->PackageId = kInjectedPackageId;
+            uint32_t assignedPkg = AppManager::Get().GetAppPackageId(appId);
+            pOwn->PackageId = (assignedPkg != 0) ? assignedPkg : kInjectedPackageId;
             pOwn->bOwnsLicense = true;
             pOwn->ReleaseState = 4; // AppReleaseState_Released
             pOwn->SteamId32 = PatchEngine::GetActiveAccountID();
@@ -659,12 +668,48 @@ static PackageInfo* Hook_GetPackageInfo(void* pThis, uint32_t packageId, uint64_
     if (!g_pCPackageInfo) {
         g_pCPackageInfo = pThis;
         HookManager::Log("GetPackageInfo: captured CPackageInfo");
-        // NOTE: no license mutation here — mutating package state from inside a
-        // GetPackageInfo call reenters Valve's locked store mid-update and has
-        // crashed the client during "Loading user data". Injection is driven
-        // exclusively from Hook_CheckAppOwnership (Steam's own thread).
     }
-    return oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
+
+    // Check if this packageId is one of our virtual game packages
+    {
+        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
+        auto it = g_virtualPackages.find(packageId);
+        if (it != g_virtualPackages.end()) {
+            return &it->second;
+        }
+    }
+
+    PackageInfo* result = oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
+    if (result) return result;
+
+    // If Steam has no record of this packageId, check if it belongs to our unlocked games
+    std::unordered_map<uint32_t, std::vector<uint32_t>> packages;
+    AppManager::Get().GetPackages(packages);
+    auto pkgIt = packages.find(packageId);
+    if (pkgIt != packages.end()) {
+        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
+        auto& storage = g_virtualPkgAppStorage[packageId];
+        storage = pkgIt->second;
+
+        auto& pkg = g_virtualPackages[packageId];
+        pkg.PackageId = packageId;
+        pkg.ChangeNumber = 1;
+        pkg.BillingType = 12; // FreeOnDemand / BillPrepurchase
+        pkg.LicenseType = 1;  // SinglePurchase
+        pkg.Status = 0;       // Available
+        memset(pkg.SHA_1_Hash, 0, sizeof(pkg.SHA_1_Hash));
+        pkg.pPackageInfoNodeBegin = nullptr;
+        pkg.pExtendNodeBegin = nullptr;
+        pkg.AppIdVec.m_Memory.m_pMemory = storage.data();
+        pkg.AppIdVec.m_Memory.m_nAllocationCount = static_cast<int>(storage.size());
+        pkg.AppIdVec.m_Size = static_cast<int>(storage.size());
+
+        HookManager::Log("GetPackageInfo: synthesized virtual package " + std::to_string(packageId) +
+                         " with " + std::to_string(storage.size()) + " appids");
+        return &pkg;
+    }
+
+    return nullptr;
 }
 
 // ── steamclient64: ConfigStoreGetBinary hook for depot decryption keys ─

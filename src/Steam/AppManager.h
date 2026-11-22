@@ -16,10 +16,12 @@ class AppManager {
 public:
     static AppManager& Get();
 
-    void AddUnlockedApp(uint32_t appId);
+    void AddUnlockedApp(uint32_t appId, uint32_t packageId = 0);
     void RemoveUnlockedApp(uint32_t appId);
     bool IsAppUnlocked(uint32_t appId) const;
     void GetUnlockedApps(std::vector<uint32_t>& out) const;
+    uint32_t GetAppPackageId(uint32_t appId) const;
+    void GetPackages(std::unordered_map<uint32_t, std::vector<uint32_t>>& out) const;
 
     void SetAppDLCs(uint32_t appId, const std::vector<uint32_t>& dlcs);
     bool IsDLCUnlocked(uint32_t appId, uint32_t dlcId) const;
@@ -45,6 +47,8 @@ private:
     AppManager() = default;
     mutable std::mutex m_mutex;
     std::unordered_set<uint32_t> m_unlockedApps;
+    std::unordered_map<uint32_t, uint32_t> m_appToPackage;
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> m_packageToApps;
     std::unordered_map<uint32_t, std::unordered_set<uint32_t>> m_appDLCs;
     std::unordered_map<uint32_t, std::vector<uint8_t>> m_depotKeys;
     std::unordered_map<uint32_t, uint64_t> m_accessTokens;

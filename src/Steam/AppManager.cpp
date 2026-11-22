@@ -7,14 +7,27 @@ AppManager& AppManager::Get() {
     return instance;
 }
 
-void AppManager::AddUnlockedApp(uint32_t appId) {
+void AppManager::AddUnlockedApp(uint32_t appId, uint32_t packageId) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_unlockedApps.insert(appId);
+    if (packageId != 0) {
+        m_appToPackage[appId] = packageId;
+        m_packageToApps[packageId].insert(appId);
+    }
 }
 
 void AppManager::RemoveUnlockedApp(uint32_t appId) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_unlockedApps.erase(appId);
+    auto it = m_appToPackage.find(appId);
+    if (it != m_appToPackage.end()) {
+        uint32_t pkg = it->second;
+        m_packageToApps[pkg].erase(appId);
+        if (m_packageToApps[pkg].empty()) {
+            m_packageToApps.erase(pkg);
+        }
+        m_appToPackage.erase(it);
+    }
 }
 
 bool AppManager::IsAppUnlocked(uint32_t appId) const {
@@ -25,6 +38,20 @@ bool AppManager::IsAppUnlocked(uint32_t appId) const {
 void AppManager::GetUnlockedApps(std::vector<uint32_t>& out) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     out.assign(m_unlockedApps.begin(), m_unlockedApps.end());
+}
+
+uint32_t AppManager::GetAppPackageId(uint32_t appId) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_appToPackage.find(appId);
+    return (it != m_appToPackage.end()) ? it->second : 0;
+}
+
+void AppManager::GetPackages(std::unordered_map<uint32_t, std::vector<uint32_t>>& out) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    out.clear();
+    for (const auto& [pkg, appSet] : m_packageToApps) {
+        out[pkg].assign(appSet.begin(), appSet.end());
+    }
 }
 
 void AppManager::SetAppDLCs(uint32_t appId, const std::vector<uint32_t>& dlcs) {
@@ -91,6 +118,8 @@ bool AppManager::IsMarkedOwned(uint32_t appId) const {
 void AppManager::Clear() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_unlockedApps.clear();
+    m_appToPackage.clear();
+    m_packageToApps.clear();
     m_appDLCs.clear();
     m_depotKeys.clear();
     m_accessTokens.clear();

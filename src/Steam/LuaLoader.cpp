@@ -46,6 +46,16 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
     std::ifstream file(filePath);
     if (!file.is_open()) return;
 
+    // Derive base app ID from filename (e.g. 552520.lua -> 552520)
+    uint32_t fileBaseAppId = 0;
+    size_t lastSlash = filePath.find_last_of(L"\\/");
+    std::wstring fileName = (lastSlash != std::wstring::npos) ? filePath.substr(lastSlash + 1) : filePath;
+    size_t dotPos = fileName.find(L'.');
+    if (dotPos != std::wstring::npos) {
+        std::wstring baseNum = fileName.substr(0, dotPos);
+        try { fileBaseAppId = std::stoul(baseNum); } catch (...) {}
+    }
+
     std::string line;
     // Common patterns in stplug-in lua manifests:
     // addappid(480) or addappid( 480 ) or addappid(480, 0, "de1f...")
@@ -59,7 +69,8 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
         std::smatch match;
         if (std::regex_search(line, match, addAppKeyRegex)) {
             uint32_t appId = std::stoul(match[1].str());
-            AppManager::Get().AddUnlockedApp(appId);
+            uint32_t pkgId = fileBaseAppId ? fileBaseAppId : appId;
+            AppManager::Get().AddUnlockedApp(appId, pkgId);
             if (match.size() > 2 && match[2].matched) {
                 std::string keyHex = match[2].str();
                 std::vector<uint8_t> keyBytes = ParseHex64(keyHex);
@@ -75,10 +86,11 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t dlcId = std::stoul(match[2].str());
             AppManager::Get().SetAppDLCs(appId, { dlcId });
-            AppManager::Get().AddUnlockedApp(dlcId);
+            AppManager::Get().AddUnlockedApp(dlcId, appId);
         } else if (std::regex_search(line, match, rawAppRegex)) {
             uint32_t appId = std::stoul(match[1].str());
-            AppManager::Get().AddUnlockedApp(appId);
+            uint32_t pkgId = fileBaseAppId ? fileBaseAppId : appId;
+            AppManager::Get().AddUnlockedApp(appId, pkgId);
         }
     }
 }
