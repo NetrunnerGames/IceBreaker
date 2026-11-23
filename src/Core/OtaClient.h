@@ -39,6 +39,39 @@ public:
         return ParsePatternsJson(jsonContent);
     }
 
+    /// Appends or updates a newly synthesized pattern in the local cache file
+    static void CacheSynthesizedPattern(const std::string& name, const std::string& pattern) {
+        if (name.empty() || pattern.empty()) return;
+
+        std::wstring cachePath = GetCacheFilePath();
+        std::string jsonContent = LoadFromCache(cachePath);
+        auto map = ParsePatternsJson(jsonContent);
+
+        // Check if pattern is already present
+        auto& list = map[name];
+        for (const auto& existing : list) {
+            if (existing == pattern) return;
+        }
+        list.insert(list.begin(), pattern); // Put newly synthesized at front
+
+        // Serialize back to JSON
+        std::ostringstream ss;
+        ss << "{\n";
+        size_t count = 0;
+        for (const auto& [k, v] : map) {
+            ss << "  \"" << k << "\": [\n";
+            for (size_t i = 0; i < v.size(); ++i) {
+                ss << "    \"" << v[i] << "\"" << (i + 1 < v.size() ? "," : "") << "\n";
+            }
+            count++;
+            ss << "  ]" << (count < map.size() ? "," : "") << "\n";
+        }
+        ss << "}\n";
+
+        SaveToCache(cachePath, ss.str());
+        HookManager::Log("OTA Cache: Stored synthesized pattern for " + name);
+    }
+
 private:
     static std::wstring GetCacheFilePath() {
         wchar_t steamPath[MAX_PATH] = { 0 };

@@ -3,6 +3,7 @@
 #include "Patterns.h"
 #include "OtaClient.h"
 #include "HeuristicResolver.h"
+#include "RvaCache.h"
 #include "HookManager.h"
 #include "../Steam/AppManager.h"
 #include "../Steam/Interfaces.h"
@@ -1050,12 +1051,21 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
                     const std::unordered_map<std::string, std::vector<std::string>>& otaPatterns) {
     if (PatchEngine::ResolvedAddress(pat.name)) return;
 
+    HMODULE hMod = reinterpret_cast<HMODULE>(base);
+
+    // 0. Fast-path: Check PE Timestamp & Size RVA Cache (0 ms, 0 pattern scanning)
+    if (uintptr_t cachedAddr = RvaCache::GetCachedAddress(hMod, pat.name)) {
+        PatchEngine::CacheResolved(pat.name, cachedAddr);
+        HookManager::Log(std::string(tag) + ": found " + pat.name + " via RVA Cache at " + Hex(cachedAddr));
+        return;
+    }
+
     // 1. Try local patterns first
     for (const auto& sig : pat.patterns) {
-        uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), sig);
+        uintptr_t addr = Scanner::ScanModule(hMod, sig);
         if (addr) {
             if (IsHookedName(pat.name)) {
-                size_t hits = Scanner::CountMatches(reinterpret_cast<HMODULE>(base), sig);
+                size_t hits = Scanner::CountMatches(hMod, sig);
                 if (hits != 1) {
                     HookManager::Log(std::string(tag) + ": " + pat.name +
                                      " matched " + std::to_string(hits) +
@@ -1064,6 +1074,7 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
                 }
             }
             PatchEngine::CacheResolved(pat.name, addr);
+            RvaCache::SaveAddress(hMod, pat.name, addr);
             HookManager::Log(std::string(tag) + ": found " + pat.name + " at " + Hex(addr));
             return;
         }
@@ -1073,9 +1084,10 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
     auto it = otaPatterns.find(pat.name);
     if (it != otaPatterns.end()) {
         for (const auto& otaSig : it->second) {
-            uintptr_t addr = Scanner::ScanModule(reinterpret_cast<HMODULE>(base), otaSig);
+            uintptr_t addr = Scanner::ScanModule(hMod, otaSig);
             if (addr) {
                 PatchEngine::CacheResolved(pat.name, addr);
+                RvaCache::SaveAddress(hMod, pat.name, addr);
                 HookManager::Log(std::string(tag) + ": found " + pat.name + " via OTA at " + Hex(addr));
                 return;
             }
@@ -1083,14 +1095,45 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
     }
 
     // 3. Fallback to in-engine heuristic discovery (string / constant xref & prologue back-scan)
+    uintptr_t heuristicAddr = 0;
     if (strcmp(pat.name, "ConfigStoreGetBinary") == 0) {
-        if (uintptr_t xref = HeuristicResolver::FindXref(reinterpret_cast<HMODULE>(base), "ConfigStore")) {
-            if (uintptr_t prologue = HeuristicResolver::FindPrologue(xref)) {
-                PatchEngine::CacheResolved(pat.name, prologue);
-                HookManager::Log(std::string(tag) + ": recovered " + pat.name + " via Heuristic at " + Hex(prologue));
-                return;
-            }
+        if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "ConfigStore")) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
         }
+    } else if (strcmp(pat.name, "ShouldShowAppInLibrary") == 0) {
+        // Look for 0x090CD6 constant
+        if (uintptr_t xref = HeuristicResolver::FindConst32(hMod, 0x090CD6)) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
+        }
+    } else if (strcmp(pat.name, "GetOrAddAppData") == 0) {
+        if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "AppInfo")) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
+        }
+    } else if (strcmp(pat.name, "BBuildAndAsyncSendFrame") == 0) {
+        if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "WebSocket")) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
+        }
+    } else if (strcmp(pat.name, "CheckAppOwnership") == 0) {
+        if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "CheckAppOwnership")) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
+        }
+    } else if (strcmp(pat.name, "GetPackageInfo") == 0) {
+        if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "Package")) {
+            heuristicAddr = HeuristicResolver::FindPrologue(xref);
+        }
+    }
+
+    if (heuristicAddr) {
+        PatchEngine::CacheResolved(pat.name, heuristicAddr);
+        RvaCache::SaveAddress(hMod, pat.name, heuristicAddr);
+        HookManager::Log(std::string(tag) + ": recovered " + pat.name + " via Heuristic at " + Hex(heuristicAddr));
+
+        // Auto-synthesize pattern and store in local cache so future boots load instantly
+        std::string synthPat = HeuristicResolver::SynthesizePattern(heuristicAddr);
+        if (!synthPat.empty()) {
+            OtaClient::CacheSynthesizedPattern(pat.name, synthPat);
+        }
+        return;
     }
 
     HookManager::Log(std::string(tag) + ": pattern not matched: " + pat.name + " (non-fatal)");
