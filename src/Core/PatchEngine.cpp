@@ -581,6 +581,8 @@ void PatchEngine::NotifyLicenseChanged(bool forceRescan) {
         g_virtualPackages.clear();
         g_virtualPkgAppStorage.clear();
     }
+    // Re-arm so new apps in the Lua registry get appended to the package
+    g_licenseDone = false;
     g_licenseChangeRequested.store(true);
 }
 
@@ -658,8 +660,8 @@ static bool Hook_CheckAppOwnership(void* pThis, uint32_t appId, AppOwnership* pO
             pOwn->bGuestPass = false;
             pOwn->bLicenseLocked = false;
             pOwn->bLicensePending = false;
-            return true;
         }
+        return true;
     }
     return result;
 }
@@ -1025,10 +1027,12 @@ static bool Hook_ShouldShowAppInLibrary(void* pThis, uint32_t appId) {
     if (AppManager::Get().IsAppUnlocked(appId)) {
         return true;
     }
-    if (oShouldShowAppInLibrary) {
+    // If not unlocked in AppManager and not marked as genuinely owned from Valve,
+    // do not show it in the library view (prevent stale memory leaks from keeping removed titles).
+    if (AppManager::Get().IsMarkedOwned(appId) && oShouldShowAppInLibrary) {
         return oShouldShowAppInLibrary(pThis, appId);
     }
-    return true;
+    return false;
 }
 
 // Names whose address gets DETOURed. For these the match must be unique across
@@ -1140,99 +1144,119 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
 }
 
 void PatchEngine::ApplyInMemoryPatches() {
-    const uintptr_t ui = UIBase();
-    const uintptr_t client = ClientBase();
-    HookManager::Log("Scanning in-memory patterns (steamui=" + Hex(ui) + " steamclient64=" + Hex(client) + ")");
+    try {
+        const uintptr_t ui = UIBase();
+        const uintptr_t client = ClientBase();
 
-    // Query OTA pattern feed asynchronously or on startup with local cache fallback
-    auto otaPatterns = OtaClient::FetchPatterns();
-    if (!otaPatterns.empty()) {
-        HookManager::Log("OTA: Loaded " + std::to_string(otaPatterns.size()) + " pattern definitions from OTA/cache.");
-    }
+        if (!ui && !client) {
+            HookManager::Log("ApplyInMemoryPatches: neither steamui nor steamclient64 loaded; skipping.");
+            return;
+        }
 
-    if (ui) {
-        for (const auto& pat : g_SteamUIPatterns) {
-            Resolve(pat, ui, "steamui", otaPatterns);
-        }
-        if (auto addr = ResolvedAddress("ShouldShowAppInLibrary")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_ShouldShowAppInLibrary),
-                                    reinterpret_cast<void**>(&oShouldShowAppInLibrary),
-                                    "ShouldShowAppInLibrary");
-        }
-    }
+        HookManager::Log("Scanning in-memory patterns (steamui=" + Hex(ui) + " steamclient64=" + Hex(client) + ")");
 
-    if (client) {
-        for (const auto& pat : g_SteamClientPatterns) {
-            Resolve(pat, client, "steamclient64", otaPatterns);
+        // Query OTA pattern feed asynchronously or on startup with local cache fallback
+        auto otaPatterns = OtaClient::FetchPatterns();
+        if (!otaPatterns.empty()) {
+            HookManager::Log("OTA: Loaded " + std::to_string(otaPatterns.size()) + " pattern definitions from OTA/cache.");
         }
-        if (auto addr = ResolvedAddress("CheckAppOwnership")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_CheckAppOwnership),
-                                    reinterpret_cast<void**>(&oCheckAppOwnership),
-                                    "CheckAppOwnership");
-            Interfaces::SetOwnershipAnchor(reinterpret_cast<void*>(addr));
-        }
-        if (auto addr = ResolvedAddress("GetPackageInfo")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_GetPackageInfo),
-                                    reinterpret_cast<void**>(&oGetPackageInfo),
-                                    "GetPackageInfo");
-        }
-        if (auto addr = ResolvedAddress("ConfigStoreGetBinary")) {
-            HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                    reinterpret_cast<void*>(&Hook_ConfigStoreGetBinary),
-                                    reinterpret_cast<void**>(&oConfigStoreGetBinary),
-                                    "ConfigStoreGetBinary");
-        }
-        if (auto addr = ResolvedAddress("GetOrAddAppData")) {
-            // OPT-IN ONLY: the current signature is ambiguous (generic prologue),
-            // so an unknown function could be hooked and its return misused as a
-            // CAppInfoCache entry — one of the corruption sources behind the
-            // "Loading user data" crashes. Enable with ICEBREAKER_APPDATA_HOOK=1
-            // only while actively debugging the anchor.
-            wchar_t flag[8] = {};
-            bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_APPDATA_HOOK", flag, 8) > 0 &&
-                           (flag[0] == L'1' || flag[0] == L'y');
-            if (!enabled) {
-                HookManager::Log("GetOrAddAppData: resolved but hook disabled by default (ambiguous signature; set ICEBREAKER_APPDATA_HOOK=1 to enable)");
-            } else {
+
+        if (ui) {
+            for (const auto& pat : g_SteamUIPatterns) {
+                try {
+                    Resolve(pat, ui, "steamui", otaPatterns);
+                } catch (...) {
+                    HookManager::Log("ApplyInMemoryPatches: exception resolving steamui pattern " + std::string(pat.name));
+                }
+            }
+            if (auto addr = ResolvedAddress("ShouldShowAppInLibrary")) {
                 HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                        reinterpret_cast<void*>(&Hook_GetOrAddAppData),
-                                        reinterpret_cast<void**>(&oGetOrAddAppData),
-                                        "GetOrAddAppData");
+                                        reinterpret_cast<void*>(&Hook_ShouldShowAppInLibrary),
+                                        reinterpret_cast<void**>(&oShouldShowAppInLibrary),
+                                        "ShouldShowAppInLibrary");
             }
         }
-        if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
-            // OPT-IN while stabilizing: the PICS access-token patcher re-encodes
-            // live IPC transport packets during login; its frame layout for this
-            // build is not independently verified yet. Enable the token rewrite
-            // with ICEBREAKER_FULL=1 only after a clean safe-mode boot.
-            wchar_t flag[8] = {};
-            bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_FULL", flag, 8) > 0 &&
-                           (flag[0] == L'1' || flag[0] == L'y');
-            if (!enabled) {
-                HookManager::Log("BBuildAndAsyncSendFrame: resolved but PICS rewrite disabled by default (set ICEBREAKER_FULL=1 to enable)");
-            } else {
+
+        if (client) {
+            for (const auto& pat : g_SteamClientPatterns) {
+                try {
+                    Resolve(pat, client, "steamclient64", otaPatterns);
+                } catch (...) {
+                    HookManager::Log("ApplyInMemoryPatches: exception resolving steamclient64 pattern " + std::string(pat.name));
+                }
+            }
+            if (auto addr = ResolvedAddress("CheckAppOwnership")) {
                 HookManager::CreateHook(reinterpret_cast<void*>(addr),
-                                        reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
-                                        reinterpret_cast<void**>(&oBBuildAndAsyncSendFrame),
-                                        "BBuildAndAsyncSendFrame");
+                                        reinterpret_cast<void*>(&Hook_CheckAppOwnership),
+                                        reinterpret_cast<void**>(&oCheckAppOwnership),
+                                        "CheckAppOwnership");
+                Interfaces::SetOwnershipAnchor(reinterpret_cast<void*>(addr));
+            }
+            if (auto addr = ResolvedAddress("GetPackageInfo")) {
+                HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                        reinterpret_cast<void*>(&Hook_GetPackageInfo),
+                                        reinterpret_cast<void**>(&oGetPackageInfo),
+                                        "GetPackageInfo");
+            }
+            if (auto addr = ResolvedAddress("ConfigStoreGetBinary")) {
+                HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                        reinterpret_cast<void*>(&Hook_ConfigStoreGetBinary),
+                                        reinterpret_cast<void**>(&oConfigStoreGetBinary),
+                                        "ConfigStoreGetBinary");
+            }
+            if (auto addr = ResolvedAddress("GetOrAddAppData")) {
+                // OPT-IN ONLY: the current signature is ambiguous (generic prologue),
+                // so an unknown function could be hooked and its return misused as a
+                // CAppInfoCache entry — one of the corruption sources behind the
+                // "Loading user data" crashes. Enable with ICEBREAKER_APPDATA_HOOK=1
+                // only while actively debugging the anchor.
+                wchar_t flag[8] = {};
+                bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_APPDATA_HOOK", flag, 8) > 0 &&
+                               (flag[0] == L'1' || flag[0] == L'y');
+                if (!enabled) {
+                    HookManager::Log("GetOrAddAppData: resolved but hook disabled by default (ambiguous signature; set ICEBREAKER_APPDATA_HOOK=1 to enable)");
+                } else {
+                    HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                            reinterpret_cast<void*>(&Hook_GetOrAddAppData),
+                                            reinterpret_cast<void**>(&oGetOrAddAppData),
+                                            "GetOrAddAppData");
+                }
+            }
+            if (auto addr = ResolvedAddress("BBuildAndAsyncSendFrame")) {
+                // OPT-IN while stabilizing: the PICS access-token patcher re-encodes
+                // live IPC transport packets during login; its frame layout for this
+                // build is not independently verified yet. Enable the token rewrite
+                // with ICEBREAKER_FULL=1 only after a clean safe-mode boot.
+                wchar_t flag[8] = {};
+                bool enabled = GetEnvironmentVariableW(L"ICEBREAKER_FULL", flag, 8) > 0 &&
+                               (flag[0] == L'1' || flag[0] == L'y');
+                if (!enabled) {
+                    HookManager::Log("BBuildAndAsyncSendFrame: resolved but PICS rewrite disabled by default (set ICEBREAKER_FULL=1 to enable)");
+                } else {
+                    HookManager::CreateHook(reinterpret_cast<void*>(addr),
+                                            reinterpret_cast<void*>(&Hook_BBuildAndAsyncSendFrame),
+                                            reinterpret_cast<void**>(&oBBuildAndAsyncSendFrame),
+                                            "BBuildAndAsyncSendFrame");
+                }
+            }
+            if (auto addr = ResolvedAddress("MarkLicenseAsChanged")) {
+                oMarkLicenseAsChanged = reinterpret_cast<pfnMarkLicenseAsChanged_t>(addr);
+            }
+            if (auto addr = ResolvedAddress("ProcessPendingLicenseUpdates")) {
+                oProcessPendingLicenseUpdates = reinterpret_cast<pfnProcessPendingLicenseUpdates_t>(addr);
+            }
+            if (auto addr = ResolvedAddress("CUtlMemoryGrow")) {
+                oCUtlMemoryGrow = reinterpret_cast<pfnCUtlMemoryGrow_t>(addr);
             }
         }
-        if (auto addr = ResolvedAddress("MarkLicenseAsChanged")) {
-            oMarkLicenseAsChanged = reinterpret_cast<pfnMarkLicenseAsChanged_t>(addr);
-        }
-        if (auto addr = ResolvedAddress("ProcessPendingLicenseUpdates")) {
-            oProcessPendingLicenseUpdates = reinterpret_cast<pfnProcessPendingLicenseUpdates_t>(addr);
-        }
-        if (auto addr = ResolvedAddress("CUtlMemoryGrow")) {
-            oCUtlMemoryGrow = reinterpret_cast<pfnCUtlMemoryGrow_t>(addr);
-        }
-    }
 
-    HookManager::Log("In-memory patching complete. Resolved " +
-                     std::to_string(s_resolved.size()) + " patterns.");
+        HookManager::Log("In-memory patching complete. Resolved " +
+                         std::to_string(s_resolved.size()) + " patterns.");
+    } catch (const std::exception& ex) {
+        HookManager::Log("ApplyInMemoryPatches: fatal exception caught: " + std::string(ex.what()) + "; Steam kept running safely.");
+    } catch (...) {
+        HookManager::Log("ApplyInMemoryPatches: unknown exception caught; Steam kept running safely.");
+    }
 }
 
 } // namespace IceBreaker

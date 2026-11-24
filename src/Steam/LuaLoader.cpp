@@ -122,10 +122,11 @@ void LuaLoader::ReloadAll() {
     HookManager::Log("Reloaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
                      std::to_string(AppManager::Get().GetUnlockedCount()));
 
-    // Sanitize any previously failed download states (e.g. UpdateResult 6 / StateFlags 6)
-    PatchEngine::SanitizeAllUnlockedDownloadStates();
-
-    PatchEngine::NotifyLicenseChanged(true);
+    // OST Parity: On dynamic hot-reload, do NOT asynchronously mutate Valve's package memory
+    // or touch ACF files mid-download, which triggers Steam panic-restarts and purges depotcache.
+    // The in-memory hooks (CheckAppOwnership, BIsSubscribedApp, BIsDlcInstalled, GetPackageInfo)
+    // already read from AppManager::Get() and apply immediately with zero risk of crashing.
+    PatchEngine::NotifyLicenseChanged(false);
 }
 
 bool LuaLoader::LoadPluginManifests() {

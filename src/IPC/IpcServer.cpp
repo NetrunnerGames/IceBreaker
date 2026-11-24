@@ -17,6 +17,21 @@ static std::thread s_worker;
 static HANDLE s_pipeHandle = INVALID_HANDLE_VALUE;
 
 std::string IpcServer::ProcessCommand(const std::string& raw) {
+    // 1. Length validation to prevent buffer/string abuse
+    if (raw.empty()) {
+        return "ERROR: empty command\n";
+    }
+    if (raw.length() > 512) {
+        return "ERROR: command exceeds maximum length\n";
+    }
+
+    // 2. Character validation: permit only printable ASCII and whitespace
+    for (unsigned char c : raw) {
+        if (c < 32 && c != '\r' && c != '\n' && c != '\t') {
+            return "ERROR: invalid characters in command\n";
+        }
+    }
+
     // Trim whitespace and newlines
     std::string cmd = raw;
     while (!cmd.empty() && (cmd.back() == '\r' || cmd.back() == '\n' || cmd.back() == ' ')) {
@@ -54,40 +69,48 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
         LuaLoader::ReloadAll();
         return "OK reloaded\n";
     }
+
+    auto parseAppId = [](const std::string& s) -> uint32_t {
+        if (s.empty() || s.length() > 10) return 0;
+        for (char c : s) {
+            if (c < '0' || c > '9') return 0;
+        }
+        try {
+            unsigned long val = std::stoul(s);
+            if (val > 0 && val <= 0xFFFFFFFFUL) return static_cast<uint32_t>(val);
+        } catch (...) {}
+        return 0;
+    };
+
     if (cmd.rfind("RETRY_APP ", 0) == 0 || cmd.rfind("SANITIZE ", 0) == 0) {
         size_t offset = (cmd.rfind("RETRY_APP ", 0) == 0) ? 10 : 9;
         std::string arg = cmd.substr(offset);
-        try {
-            uint32_t appId = std::stoul(arg);
-            PatchEngine::SanitizeAppDownloadState(appId);
-            PatchEngine::NotifyLicenseChanged(true);
-            HookManager::Log("IPC: sanitized download state and re-armed license for appId " + std::to_string(appId));
-            return "OK retried " + std::to_string(appId) + "\n";
-        } catch (...) {
-            return "ERROR: invalid appId\n";
-        }
+        uint32_t appId = parseAppId(arg);
+        if (appId == 0) return "ERROR: invalid appId\n";
+
+        PatchEngine::SanitizeAppDownloadState(appId);
+        PatchEngine::NotifyLicenseChanged(true);
+        HookManager::Log("IPC: sanitized download state and re-armed license for appId " + std::to_string(appId));
+        return "OK retried " + std::to_string(appId) + "\n";
     }
     if (cmd.rfind("UNLOCK ", 0) == 0) {
         std::string arg = cmd.substr(7);
-        try {
-            uint32_t appId = std::stoul(arg);
-            AppManager::Get().AddUnlockedApp(appId);
-            HookManager::Log("IPC: dynamically unlocked appId " + std::to_string(appId));
-            return "OK unlocked " + std::to_string(appId) + "\n";
-        } catch (...) {
-            return "ERROR: invalid appId\n";
-        }
+        uint32_t appId = parseAppId(arg);
+        if (appId == 0) return "ERROR: invalid appId\n";
+
+        AppManager::Get().AddUnlockedApp(appId);
+        HookManager::Log("IPC: dynamically unlocked appId " + std::to_string(appId));
+        return "OK unlocked " + std::to_string(appId) + "\n";
     }
     if (cmd.rfind("LOCK ", 0) == 0) {
         std::string arg = cmd.substr(5);
-        try {
-            uint32_t appId = std::stoul(arg);
-            AppManager::Get().RemoveUnlockedApp(appId);
-            HookManager::Log("IPC: dynamically locked appId " + std::to_string(appId));
-            return "OK locked " + std::to_string(appId) + "\n";
-        } catch (...) {
-            return "ERROR: invalid appId\n";
-        }
+        uint32_t appId = parseAppId(arg);
+        if (appId == 0) return "ERROR: invalid appId\n";
+
+        AppManager::Get().RemoveUnlockedApp(appId);
+        PatchEngine::NotifyLicenseChanged(true);
+        HookManager::Log("IPC: dynamically locked appId and re-armed license for " + std::to_string(appId));
+        return "OK locked " + std::to_string(appId) + "\n";
     }
 
     return "ERROR: unknown command\n";

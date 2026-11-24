@@ -1,16 +1,37 @@
 #include "HookManager.h"
 #include <fstream>
 #include <mutex>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 namespace IceBreaker {
 
 static std::mutex g_logMutex;
 
+static std::string GetCurrentTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm bt{};
+#if defined(_WIN32)
+    localtime_s(&bt, &in_time_t);
+#else
+    localtime_r(&in_time_t, &bt);
+#endif
+
+    std::ostringstream ss;
+    ss << std::put_time(&bt, "%Y-%m-%d %H:%M:%S")
+       << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
+
 void HookManager::Log(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::ofstream out("icebreaker.log", std::ios::app);
     if (out.is_open()) {
-        out << "[IceBreaker] " << message << "\n";
+        out << "[" << GetCurrentTimestamp() << "] [IceBreaker] " << message << "\n";
     }
 }
 

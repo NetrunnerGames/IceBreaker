@@ -81,6 +81,9 @@ static void InitializeIceBreaker()
             Sleep(200);
             attempts++;
         }
+        if (!GetModuleHandleW(L"steamui.dll")) {
+            IceBreaker::HookManager::Log("steamui.dll not detected after timeout; proceeding with steamclient64 patches only.");
+        }
         Sleep(500); // Give the loader a brief window to finish imports/relocations
         IceBreaker::PatchEngine::ApplyInMemoryPatches();
     }).detach();
@@ -101,10 +104,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         std::thread(InitializeIceBreaker).detach();
         break;
     case DLL_PROCESS_DETACH:
-        IceBreaker::IpcServer::Stop();
-        IceBreaker::LuaLoader::StopReloadWatcher();
-        IceBreaker::HookManager::Shutdown();
-        IceBreaker::VersionProxy::UnloadRealDll();
+        if (lpReserved == nullptr) {
+            // Dynamic FreeLibrary: safe to perform full cooperative teardown
+            IceBreaker::IpcServer::Stop();
+            IceBreaker::LuaLoader::StopReloadWatcher();
+            IceBreaker::HookManager::Shutdown();
+            IceBreaker::VersionProxy::UnloadRealDll();
+        } else {
+            // Process termination: threads and CRT are already halting; only unhook without deadlock
+            IceBreaker::HookManager::Shutdown();
+        }
         break;
     }
     return TRUE;
