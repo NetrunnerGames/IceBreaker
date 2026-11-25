@@ -43,6 +43,12 @@ public:
     void Clear();
     size_t GetUnlockedCount() const;
 
+    // Diff-based reconciliation: atomically swaps in newly scanned state, returns whether apps/packages changed
+    bool ReconcileState(const std::unordered_map<uint32_t, uint32_t>& newAppToPackage,
+                        const std::unordered_map<uint32_t, std::unordered_set<uint32_t>>& newAppDLCs,
+                        const std::unordered_map<uint32_t, std::vector<uint8_t>>& newDepotKeys,
+                        const std::unordered_map<uint32_t, uint64_t>& newAccessTokens);
+
 private:
     AppManager() = default;
     mutable std::mutex m_mutex;

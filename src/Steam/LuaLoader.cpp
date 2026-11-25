@@ -47,7 +47,11 @@ std::wstring LuaLoader::GetSteamPluginDir() {
     return L"";
 }
 
-void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
+void LuaLoader::ParseLuaFile(const std::wstring& filePath,
+                             std::unordered_map<uint32_t, uint32_t>& appToPackage,
+                             std::unordered_map<uint32_t, std::unordered_set<uint32_t>>& appDLCs,
+                             std::unordered_map<uint32_t, std::vector<uint8_t>>& depotKeys,
+                             std::unordered_map<uint32_t, uint64_t>& accessTokens) {
     std::ifstream file(filePath);
     if (!file.is_open()) return;
 
@@ -62,9 +66,6 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
     }
 
     std::string line;
-    // Common patterns in stplug-in lua manifests:
-    // addappid(480) or addappid( 480 ) or addappid(480, 0, "de1f...")
-    // set_dlc(480, 520) or setdlc(...)
     std::regex addAppKeyRegex(R"(addappid\s*\(\s*(\d+)(?:\s*,\s*\d+\s*,\s*["']([a-fA-F0-9]{64})["'])?)", std::regex_constants::icase);
     std::regex dlcRegex(R"((?:set_dlc|add_dlc|setdlc)\s*\(\s*(\d+)\s*,\s*(\d+))", std::regex_constants::icase);
     std::regex addTokenRegex(R"(addtoken\s*\(\s*(\d+)\s*,\s*["'](\d+)["']\s*\))", std::regex_constants::icase);
@@ -75,27 +76,27 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
         if (std::regex_search(line, match, addAppKeyRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t pkgId = fileBaseAppId ? fileBaseAppId : appId;
-            AppManager::Get().AddUnlockedApp(appId, pkgId);
+            appToPackage[appId] = pkgId;
             if (match.size() > 2 && match[2].matched) {
                 std::string keyHex = match[2].str();
                 std::vector<uint8_t> keyBytes = ParseHex64(keyHex);
                 if (keyBytes.size() == 32) {
-                    AppManager::Get().SetDepotKey(appId, keyBytes);
+                    depotKeys[appId] = keyBytes;
                 }
             }
         } else if (std::regex_search(line, match, addTokenRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint64_t token = std::stoull(match[2].str());
-            AppManager::Get().SetAccessToken(appId, token);
+            if (token != 0) accessTokens[appId] = token;
         } else if (std::regex_search(line, match, dlcRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t dlcId = std::stoul(match[2].str());
-            AppManager::Get().SetAppDLCs(appId, { dlcId });
-            AppManager::Get().AddUnlockedApp(dlcId, appId);
+            appDLCs[appId].insert(dlcId);
+            appToPackage[dlcId] = appId;
         } else if (std::regex_search(line, match, rawAppRegex)) {
             uint32_t appId = std::stoul(match[1].str());
             uint32_t pkgId = fileBaseAppId ? fileBaseAppId : appId;
-            AppManager::Get().AddUnlockedApp(appId, pkgId);
+            appToPackage[appId] = pkgId;
         }
     }
 }
@@ -103,19 +104,17 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
 void LuaLoader::ReloadAll() {
     std::lock_guard<std::mutex> lock(g_reloadMutex);
 
-    // Debounce reloads within 300ms to collapse rapid file watcher / IPC events
+    // In-DLL debounce (500ms) to coalesce rapid file watcher / IPC events
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastReloadTime).count();
-    if (elapsed < 300 && g_lastReloadTime != std::chrono::steady_clock::time_point{}) {
-        HookManager::Log("ReloadAll: debounced (called " + std::to_string(elapsed) + "ms since last reload)");
+    if (elapsed < 500 && g_lastReloadTime != std::chrono::steady_clock::time_point{}) {
+        HookManager::Log("ReloadAll: debounced (called " + std::to_string(elapsed) + "ms since last reload; skipped)");
         return;
     }
     g_lastReloadTime = now;
 
     std::wstring pluginDir = GetSteamPluginDir();
     if (pluginDir.empty()) return;
-
-    AppManager::Get().Clear();
 
     std::wstring searchPattern = pluginDir + L"\\*.lua";
     WIN32_FIND_DATAW findData;
@@ -125,24 +124,34 @@ void LuaLoader::ReloadAll() {
         return;
     }
 
+    std::unordered_map<uint32_t, uint32_t> scannedAppToPackage;
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> scannedAppDLCs;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> scannedDepotKeys;
+    std::unordered_map<uint32_t, uint64_t> scannedAccessTokens;
+
     size_t count = 0;
     do {
         if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
             std::wstring fullPath = pluginDir + L"\\" + findData.cFileName;
-            ParseLuaFile(fullPath);
+            ParseLuaFile(fullPath, scannedAppToPackage, scannedAppDLCs, scannedDepotKeys, scannedAccessTokens);
             count++;
         }
     } while (FindNextFileW(hFind, &findData));
 
     FindClose(hFind);
-    HookManager::Log("Reloaded " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
-                     std::to_string(AppManager::Get().GetUnlockedCount()));
 
-    // OST Parity: On dynamic hot-reload, do NOT asynchronously mutate Valve's package memory
-    // or touch ACF files mid-download, which triggers Steam panic-restarts and purges depotcache.
-    // The in-memory hooks (CheckAppOwnership, BIsSubscribedApp, BIsDlcInstalled, GetPackageInfo)
-    // already read from AppManager::Get() and apply immediately with zero risk of crashing.
-    PatchEngine::NotifyLicenseChanged(false);
+    // Reconcile against current in-memory state: calculate diff atomically
+    bool changed = AppManager::Get().ReconcileState(scannedAppToPackage, scannedAppDLCs, scannedDepotKeys, scannedAccessTokens);
+
+    HookManager::Log("Scanned " + std::to_string(count) + " Lua manifests. Total unlocked AppIDs: " +
+                     std::to_string(AppManager::Get().GetUnlockedCount()) +
+                     " (state change: " + (changed ? "YES" : "NO") + ")");
+
+    // Only notify Steam when something actually changed!
+    if (changed) {
+        HookManager::Log("Lua manifests changed on disk: triggering license change notification.");
+        PatchEngine::NotifyLicenseChanged(false);
+    }
 }
 
 bool LuaLoader::LoadPluginManifests() {

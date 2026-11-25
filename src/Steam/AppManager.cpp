@@ -118,6 +118,48 @@ bool AppManager::IsMarkedOwned(uint32_t appId) const {
     return m_ownedApps.count(appId) != 0;
 }
 
+bool AppManager::ReconcileState(
+    const std::unordered_map<uint32_t, uint32_t>& newAppToPackage,
+    const std::unordered_map<uint32_t, std::unordered_set<uint32_t>>& newAppDLCs,
+    const std::unordered_map<uint32_t, std::vector<uint8_t>>& newDepotKeys,
+    const std::unordered_map<uint32_t, uint64_t>& newAccessTokens)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Build new unlocked apps set
+    std::unordered_set<uint32_t> newUnlockedApps;
+    newUnlockedApps.reserve(newAppToPackage.size());
+    for (const auto& [appId, _] : newAppToPackage) {
+        newUnlockedApps.insert(appId);
+    }
+
+    // Build new packageToApps mapping
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> newPackageToApps;
+    for (const auto& [appId, pkgId] : newAppToPackage) {
+        if (pkgId != 0) {
+            newPackageToApps[pkgId].insert(appId);
+        }
+    }
+
+    // Check if the set of unlocked apps or their package assignments changed
+    bool changed = (m_unlockedApps != newUnlockedApps) || (m_appToPackage != newAppToPackage);
+
+    // If apps didn't change, check if DLC configurations changed
+    if (!changed && m_appDLCs != newAppDLCs) {
+        changed = true;
+    }
+
+    // Apply the newly reconciled state
+    m_unlockedApps = std::move(newUnlockedApps);
+    m_appToPackage = newAppToPackage;
+    m_packageToApps = std::move(newPackageToApps);
+    m_appDLCs = newAppDLCs;
+    m_depotKeys = newDepotKeys;
+    m_accessTokens = newAccessTokens;
+
+    return changed;
+}
+
 void AppManager::Clear() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_unlockedApps.clear();
