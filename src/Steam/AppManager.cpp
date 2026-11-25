@@ -28,6 +28,9 @@ void AppManager::RemoveUnlockedApp(uint32_t appId) {
         }
         m_appToPackage.erase(it);
     }
+    m_appDLCs.erase(appId);
+    m_accessTokens.erase(appId);
+    m_ownedApps.erase(appId);
 }
 
 bool AppManager::IsAppUnlocked(uint32_t appId) const {

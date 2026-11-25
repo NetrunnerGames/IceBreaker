@@ -8,11 +8,16 @@
 #include <thread>
 #include <windows.h>
 #include <vector>
+#include <chrono>
+#include <mutex>
 
 namespace IceBreaker {
 
 std::atomic<bool> LuaLoader::s_stopFlag{false};
 std::atomic<bool> LuaLoader::s_watcherRunning{false};
+
+static std::mutex g_reloadMutex;
+static std::chrono::steady_clock::time_point g_lastReloadTime{};
 
 static uint8_t ParseHexNibble(char c) {
     if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
@@ -96,6 +101,17 @@ void LuaLoader::ParseLuaFile(const std::wstring& filePath) {
 }
 
 void LuaLoader::ReloadAll() {
+    std::lock_guard<std::mutex> lock(g_reloadMutex);
+
+    // Debounce reloads within 300ms to collapse rapid file watcher / IPC events
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastReloadTime).count();
+    if (elapsed < 300 && g_lastReloadTime != std::chrono::steady_clock::time_point{}) {
+        HookManager::Log("ReloadAll: debounced (called " + std::to_string(elapsed) + "ms since last reload)");
+        return;
+    }
+    g_lastReloadTime = now;
+
     std::wstring pluginDir = GetSteamPluginDir();
     if (pluginDir.empty()) return;
 

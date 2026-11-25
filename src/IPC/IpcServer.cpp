@@ -99,7 +99,8 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
         if (appId == 0) return "ERROR: invalid appId\n";
 
         AppManager::Get().AddUnlockedApp(appId);
-        HookManager::Log("IPC: dynamically unlocked appId " + std::to_string(appId));
+        PatchEngine::NotifyLicenseChanged(true);
+        HookManager::Log("IPC: dynamically unlocked appId and notified license refresh for " + std::to_string(appId));
         return "OK unlocked " + std::to_string(appId) + "\n";
     }
     if (cmd.rfind("LOCK ", 0) == 0) {
