@@ -120,10 +120,25 @@ private:
         HINTERNET hInternet = InternetOpenA("IceBreaker-OTA/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
         if (!hInternet) return "";
 
+        DWORD timeoutMs = 2000;
+        InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
         // INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE
         DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE;
         HINTERNET hUrl = InternetOpenUrlA(hInternet, url.c_str(), nullptr, 0, flags, 0);
         if (!hUrl) {
+            InternetCloseHandle(hInternet);
+            return "";
+        }
+        InternetSetOptionA(hUrl, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+        DWORD statusCode = 0;
+        DWORD statusLen = sizeof(statusCode);
+        if (!HttpQueryInfoA(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusLen, nullptr) ||
+            statusCode < 200 || statusCode >= 300) {
+            InternetCloseHandle(hUrl);
             InternetCloseHandle(hInternet);
             return "";
         }
@@ -133,6 +148,7 @@ private:
         DWORD bytesRead = 0;
 
         while (InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+            if (response.size() + bytesRead > 2 * 1024 * 1024) break;
             response.append(buffer, bytesRead);
         }
 

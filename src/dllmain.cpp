@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <string>
 #include <thread>
+#include <atomic>
 #include "Core/HookManager.h"
 #include "Core/PatchEngine.h"
 #include "Steam/Interfaces.h"
@@ -57,8 +58,11 @@ BOOL WINAPI Proxy_VerQueryValueW(LPCVOID block, LPCWSTR subblock, LPVOID* buffer
 
 }
 
+static std::atomic<bool> g_exiting{ false };
+
 static void InitializeIceBreaker()
 {
+    if (g_exiting.load()) return;
     IceBreaker::HookManager::Log("IceBreaker initializing...");
     IceBreaker::HookManager::Initialize();
 
@@ -77,14 +81,16 @@ static void InitializeIceBreaker()
     // AOB patterns (OST-style in-memory patching).
     std::thread([]() {
         int attempts = 0;
-        while (!GetModuleHandleW(L"steamui.dll") && attempts < 150) {
+        while (!g_exiting.load() && !GetModuleHandleW(L"steamui.dll") && attempts < 150) {
             Sleep(200);
             attempts++;
         }
+        if (g_exiting.load()) return;
         if (!GetModuleHandleW(L"steamui.dll")) {
             IceBreaker::HookManager::Log("steamui.dll not detected after timeout; proceeding with steamclient64 patches only.");
         }
         Sleep(500); // Give the loader a brief window to finish imports/relocations
+        if (g_exiting.load()) return;
         IceBreaker::PatchEngine::ApplyInMemoryPatches();
     }).detach();
 
@@ -104,15 +110,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         std::thread(InitializeIceBreaker).detach();
         break;
     case DLL_PROCESS_DETACH:
+        g_exiting.store(true);
         if (lpReserved == nullptr) {
             // Dynamic FreeLibrary: safe to perform full cooperative teardown
             IceBreaker::IpcServer::Stop();
             IceBreaker::LuaLoader::StopReloadWatcher();
-            IceBreaker::HookManager::Shutdown();
+            IceBreaker::HookManager::Shutdown(false);
             IceBreaker::VersionProxy::UnloadRealDll();
         } else {
-            // Process termination: threads and CRT are already halting; only unhook without deadlock
-            IceBreaker::HookManager::Shutdown();
+            // Process termination: threads and CRT are already halting; only unhook without deadlock/CRT log
+            IceBreaker::HookManager::Shutdown(true);
         }
         break;
     }

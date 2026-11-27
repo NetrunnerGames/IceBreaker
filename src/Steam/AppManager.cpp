@@ -141,13 +141,12 @@ bool AppManager::ReconcileState(
         }
     }
 
-    // Check if the set of unlocked apps or their package assignments changed
-    bool changed = (m_unlockedApps != newUnlockedApps) || (m_appToPackage != newAppToPackage);
-
-    // If apps didn't change, check if DLC configurations changed
-    if (!changed && m_appDLCs != newAppDLCs) {
-        changed = true;
-    }
+    // Check if the set of unlocked apps, packages, DLCs, depot keys, or access tokens changed
+    bool changed = (m_unlockedApps != newUnlockedApps) ||
+                   (m_appToPackage != newAppToPackage) ||
+                   (m_appDLCs != newAppDLCs) ||
+                   (m_depotKeys != newDepotKeys) ||
+                   (m_accessTokens != newAccessTokens);
 
     // Apply the newly reconciled state
     m_unlockedApps = std::move(newUnlockedApps);

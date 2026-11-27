@@ -1,0 +1,14 @@
+C:\Users\Flynn\Projects\IceBreaker\vendor\minhook\src\buffer.c;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\buffer.obj
+C:\Users\Flynn\Projects\IceBreaker\vendor\minhook\src\hook.c;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\hook.obj
+C:\Users\Flynn\Projects\IceBreaker\vendor\minhook\src\trampoline.c;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\trampoline.obj
+C:\Users\Flynn\Projects\IceBreaker\vendor\minhook\src\hde\hde32.c;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\hde32.obj
+C:\Users\Flynn\Projects\IceBreaker\vendor\minhook\src\hde\hde64.c;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\hde64.obj
+C:\Users\Flynn\Projects\IceBreaker\src\dllmain.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\dllmain.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Core\Scanner.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\Scanner.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Core\HookManager.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\HookManager.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Core\PatchEngine.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\PatchEngine.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Proxy\VersionProxy.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\VersionProxy.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Steam\AppManager.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\AppManager.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Steam\LuaLoader.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\LuaLoader.obj
+C:\Users\Flynn\Projects\IceBreaker\src\Steam\Interfaces.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\Interfaces.obj
+C:\Users\Flynn\Projects\IceBreaker\src\IPC\IpcServer.cpp;C:\Users\Flynn\Projects\IceBreaker\build-sym\version.dir\Release\IpcServer.obj

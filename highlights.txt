@@ -1,2 +1,2 @@
-- Added depotcache protection hook to prevent Steam from purging unlocked cache files
-- Improved compatibility with locally cached game files
+- Instant startup hook initialization (removed 20s+ synchronous network delay)
+- Hardened heuristic scanner & cooperative shutdown stability

@@ -1,2 +1,3 @@
-[+] Added DeleteFileW protection hook to prevent Steam from purging unlocked depotcache files
-[+] Improved compatibility with locally cached game files
+[+] Removed synchronous startup network fetch to eliminate 20s+ hook initialization delay
+[+] Hardened heuristic scanner with VirtualQuery bounds checks and PE section validation
+[+] Added cooperative thread shutdown and exit guards to prevent unload race conditions

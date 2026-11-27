@@ -45,10 +45,12 @@ bool HookManager::Initialize() {
     return true;
 }
 
-void HookManager::Shutdown() {
+void HookManager::Shutdown(bool skipLog) {
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
-    Log("HookManager shutdown.");
+    if (!skipLog) {
+        Log("HookManager shutdown.");
+    }
 }
 
 bool HookManager::CreateHook(void* target, void* detour, void** original, const std::string& name) {

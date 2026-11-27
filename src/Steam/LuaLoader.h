@@ -26,6 +26,7 @@ private:
                              std::unordered_map<uint32_t, std::vector<uint8_t>>& depotKeys,
                              std::unordered_map<uint32_t, uint64_t>& accessTokens);
     static void WatcherLoop(std::wstring pluginDir);
+    static void DebounceWorkerLoop();
     static std::atomic<bool> s_stopFlag;
     static std::atomic<bool> s_watcherRunning;
 };

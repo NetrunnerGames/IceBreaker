@@ -14,7 +14,14 @@ namespace IceBreaker {
 static const wchar_t* kPipeName = L"\\\\.\\pipe\\IceBreaker_IPC";
 static std::atomic<bool> s_running{ false };
 static std::thread s_worker;
-static HANDLE s_pipeHandle = INVALID_HANDLE_VALUE;
+static HANDLE s_stopEvent = NULL;
+
+static std::string TrimWhitespace(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
 
 std::string IpcServer::ProcessCommand(const std::string& raw) {
     // 1. Length validation to prevent buffer/string abuse
@@ -32,15 +39,9 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
         }
     }
 
-    // Trim whitespace and newlines
-    std::string cmd = raw;
-    while (!cmd.empty() && (cmd.back() == '\r' || cmd.back() == '\n' || cmd.back() == ' ')) {
-        cmd.pop_back();
-    }
-    size_t start = cmd.find_first_not_of(" \t\r\n");
-    if (start != std::string::npos) {
-        cmd = cmd.substr(start);
-    } else {
+    // Trim leading/trailing whitespace and newlines
+    std::string cmd = TrimWhitespace(raw);
+    if (cmd.empty()) {
         return "ERROR: empty command\n";
     }
 
@@ -84,7 +85,7 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
 
     if (cmd.rfind("RETRY_APP ", 0) == 0 || cmd.rfind("SANITIZE ", 0) == 0) {
         size_t offset = (cmd.rfind("RETRY_APP ", 0) == 0) ? 10 : 9;
-        std::string arg = cmd.substr(offset);
+        std::string arg = TrimWhitespace(cmd.substr(offset));
         uint32_t appId = parseAppId(arg);
         if (appId == 0) return "ERROR: invalid appId\n";
 
@@ -94,7 +95,7 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
         return "OK retried " + std::to_string(appId) + "\n";
     }
     if (cmd.rfind("UNLOCK ", 0) == 0) {
-        std::string arg = cmd.substr(7);
+        std::string arg = TrimWhitespace(cmd.substr(7));
         uint32_t appId = parseAppId(arg);
         if (appId == 0) return "ERROR: invalid appId\n";
 
@@ -104,7 +105,7 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
         return "OK unlocked " + std::to_string(appId) + "\n";
     }
     if (cmd.rfind("LOCK ", 0) == 0) {
-        std::string arg = cmd.substr(5);
+        std::string arg = TrimWhitespace(cmd.substr(5));
         uint32_t appId = parseAppId(arg);
         if (appId == 0) return "ERROR: invalid appId\n";
 
@@ -120,69 +121,169 @@ std::string IpcServer::ProcessCommand(const std::string& raw) {
 void IpcServer::WorkerThread() {
     HookManager::Log("IPC: named pipe server starting on " + std::string("\\\\.\\pipe\\IceBreaker_IPC"));
 
+    HANDLE hIoEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!hIoEvent) {
+        HookManager::Log("IPC: CreateEvent failed, stopping worker.");
+        return;
+    }
+
+    HANDLE hPipe = INVALID_HANDLE_VALUE;
+
     while (s_running.load()) {
-        HANDLE hPipe = CreateNamedPipeW(
-            kPipeName,
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            4096,
-            4096,
-            0,
-            NULL
-        );
-
         if (hPipe == INVALID_HANDLE_VALUE) {
-            HookManager::Log("IPC: CreateNamedPipe failed, error: " + std::to_string(GetLastError()));
-            Sleep(1000);
-            continue;
-        }
+            hPipe = CreateNamedPipeW(
+                kPipeName,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                0,
+                NULL
+            );
 
-        s_pipeHandle = hPipe;
-
-        BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (connected && s_running.load()) {
-            char buffer[4096];
-            DWORD bytesRead = 0;
-
-            while (s_running.load() && ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-                buffer[bytesRead] = '\0';
-                std::string response = ProcessCommand(buffer);
-                DWORD bytesWritten = 0;
-                WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.length()), &bytesWritten, NULL);
-                FlushFileBuffers(hPipe);
+            if (hPipe == INVALID_HANDLE_VALUE) {
+                HookManager::Log("IPC: CreateNamedPipe failed, error: " + std::to_string(GetLastError()));
+                if (s_stopEvent) {
+                    WaitForSingleObject(s_stopEvent, 1000);
+                } else {
+                    Sleep(1000);
+                }
+                continue;
             }
         }
 
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
-        s_pipeHandle = INVALID_HANDLE_VALUE;
+        OVERLAPPED ov{};
+        ov.hEvent = hIoEvent;
+        ResetEvent(hIoEvent);
+
+        bool connected = false;
+        if (ConnectNamedPipe(hPipe, &ov)) {
+            connected = true;
+        } else {
+            DWORD err = GetLastError();
+            if (err == ERROR_PIPE_CONNECTED) {
+                connected = true;
+            } else if (err == ERROR_IO_PENDING) {
+                HANDLE waitHandles[2] = { s_stopEvent, hIoEvent };
+                DWORD waitCount = s_stopEvent ? 2 : 1;
+                DWORD waitIdx = s_stopEvent ? WaitForMultipleObjects(waitCount, waitHandles, FALSE, INFINITE)
+                                            : WaitForSingleObject(hIoEvent, INFINITE);
+                if (s_stopEvent && waitIdx == WAIT_OBJECT_0) {
+                    CancelIoEx(hPipe, &ov);
+                    DWORD unused = 0;
+                    GetOverlappedResult(hPipe, &ov, &unused, TRUE);
+                } else if ((!s_stopEvent && waitIdx == WAIT_OBJECT_0) ||
+                           (s_stopEvent && waitIdx == WAIT_OBJECT_0 + 1)) {
+                    DWORD unused = 0;
+                    connected = GetOverlappedResult(hPipe, &ov, &unused, FALSE) != FALSE;
+                }
+            } else {
+                CloseHandle(hPipe);
+                hPipe = INVALID_HANDLE_VALUE;
+                continue;
+            }
+        }
+
+        if (connected && s_running.load()) {
+            char buffer[4096];
+            while (s_running.load()) {
+                OVERLAPPED readOv{};
+                readOv.hEvent = hIoEvent;
+                ResetEvent(hIoEvent);
+
+                DWORD bytesRead = 0;
+                BOOL readOk = ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, &readOv);
+                if (!readOk) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        HANDLE waitHandles[2] = { s_stopEvent, hIoEvent };
+                        DWORD waitCount = s_stopEvent ? 2 : 1;
+                        DWORD waitIdx = s_stopEvent ? WaitForMultipleObjects(waitCount, waitHandles, FALSE, INFINITE)
+                                                    : WaitForSingleObject(hIoEvent, INFINITE);
+                        if (s_stopEvent && waitIdx == WAIT_OBJECT_0) {
+                            CancelIoEx(hPipe, &readOv);
+                            GetOverlappedResult(hPipe, &readOv, &bytesRead, TRUE);
+                            break;
+                        }
+                        if (!GetOverlappedResult(hPipe, &readOv, &bytesRead, FALSE)) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (bytesRead == 0) break;
+
+                buffer[bytesRead] = '\0';
+                std::string response = ProcessCommand(buffer);
+
+                OVERLAPPED writeOv{};
+                writeOv.hEvent = hIoEvent;
+                ResetEvent(hIoEvent);
+                DWORD bytesWritten = 0;
+                BOOL writeOk = WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.length()), &bytesWritten, &writeOv);
+                if (!writeOk) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        HANDLE waitHandles[2] = { s_stopEvent, hIoEvent };
+                        DWORD waitCount = s_stopEvent ? 2 : 1;
+                        DWORD waitIdx = s_stopEvent ? WaitForMultipleObjects(waitCount, waitHandles, FALSE, INFINITE)
+                                                    : WaitForSingleObject(hIoEvent, INFINITE);
+                        if (s_stopEvent && waitIdx == WAIT_OBJECT_0) {
+                            CancelIoEx(hPipe, &writeOv);
+                            GetOverlappedResult(hPipe, &writeOv, &bytesWritten, TRUE);
+                            break;
+                        }
+                        if (!GetOverlappedResult(hPipe, &writeOv, &bytesWritten, FALSE)) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!DisconnectNamedPipe(hPipe)) {
+            CloseHandle(hPipe);
+            hPipe = INVALID_HANDLE_VALUE;
+        }
     }
 
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(hPipe);
+        CloseHandle(hPipe);
+    }
+
+    CloseHandle(hIoEvent);
     HookManager::Log("IPC: named pipe server stopped.");
 }
 
 void IpcServer::Start() {
     if (s_running.exchange(true)) return;
+    if (!s_stopEvent) {
+        s_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    } else {
+        ResetEvent(s_stopEvent);
+    }
     s_worker = std::thread(WorkerThread);
 }
 
 void IpcServer::Stop() {
     if (!s_running.exchange(false)) return;
 
-    if (s_pipeHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(s_pipeHandle);
-        s_pipeHandle = INVALID_HANDLE_VALUE;
-    }
-
-    // Connect briefly to unblock ConnectNamedPipe if waiting
-    HANDLE hClient = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hClient != INVALID_HANDLE_VALUE) {
-        CloseHandle(hClient);
+    if (s_stopEvent) {
+        SetEvent(s_stopEvent);
     }
 
     if (s_worker.joinable()) {
         s_worker.join();
+    }
+
+    if (s_stopEvent) {
+        CloseHandle(s_stopEvent);
+        s_stopEvent = NULL;
     }
 }
 

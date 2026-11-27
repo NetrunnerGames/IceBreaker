@@ -10,6 +10,9 @@
 #include <sstream>
 #include <cstdint>
 #include <vector>
+#include <deque>
+#include <unordered_set>
+#include <algorithm>
 #include <cstring>
 #include <atomic>
 #include <mutex>
@@ -197,8 +200,9 @@ static bool g_licenseInitialized = false;
 static std::atomic<bool> g_licenseChangeRequested{ false };
 static std::mutex g_licenseMutex;
 static std::atomic<int> g_maintenanceAttempts{ 0 };
-static bool g_licenseDone = false;
+static std::atomic<bool> g_licenseDone{ false };
 static std::atomic<bool> g_licenseForceReset{ false };
+static std::atomic<uint64_t> g_licenseStateVersion{ 1 };
 
 // ── App Download State Sanitizer ──────────────────────────────────────────
 // When an app download fails while IceBreaker was not hooked or missing a key,
@@ -335,7 +339,8 @@ static bool ValidatePackageInfo(const PackageInfo* pPkg) {
 
 // Appends ids to the license vector only when spare capacity allows. Returns the
 // number of ids actually written.
-static uint32_t AppendAppIds(PackageInfo* pPkg, const std::vector<uint32_t>& wanted) {
+static uint32_t AppendAppIds(PackageInfo* pPkg, const std::vector<uint32_t>& wanted,
+                             std::vector<uint32_t>* newlyAdded = nullptr) {
     auto& vec = pPkg->AppIdVec;
     uint32_t written = 0;
     for (uint32_t id : wanted) {
@@ -351,6 +356,7 @@ static uint32_t AppendAppIds(PackageInfo* pPkg, const std::vector<uint32_t>& wan
             break;
         }
         vec.m_Memory.m_pMemory[vec.m_Size++] = id;
+        if (newlyAdded) newlyAdded->push_back(id);
         ++written;
     }
     return written;
@@ -388,9 +394,16 @@ static bool GrowVectorRaw(CUtlVector<uint32_t>* vec, int growBy) {
 }
 
 // ── Dynamic synthetic package cache for Multi-Package architecture (Solution A)
+struct VirtualPkgEntry {
+    PackageInfo info{};
+    std::vector<uint32_t> storage;
+    bool active = false;
+    uint64_t version = 0;
+};
 static std::mutex g_virtualPkgMutex;
-static std::unordered_map<uint32_t, PackageInfo> g_virtualPackages;
-static std::unordered_map<uint32_t, std::vector<uint32_t>> g_virtualPkgAppStorage;
+static std::unordered_map<uint32_t, VirtualPkgEntry> g_virtualPackages;
+static std::deque<std::vector<uint32_t>> g_retiredPkgStorage;
+static std::unordered_set<uint32_t> g_injectedPkg0Apps;
 
 // ── single-owner license maintenance ─────────────────────────────────
 // ALL package-state mutation happens here, always on the thread that invoked
@@ -399,12 +412,10 @@ static std::unordered_map<uint32_t, std::vector<uint32_t>> g_virtualPkgAppStorag
 // watcher, DataJackUI) only raise the request flag — never touch Valve state.
 //
 // STABILITY RULES learned from crash forensics:
-//  * One-shot: the license vector is populated exactly once per process; later
-//    Notify requests are ignored until restart. Repeated appends race Steam's
-//    own multithreaded license pipeline and corrupt the heap.
-//  * Capacity-only: we never grow Valve's vector ourselves. Steam grows it as
-//    it processes licenses (observed directly in dumps); we write into spare
-//    capacity that exists at that moment, and defer the rest.
+//  * Serialized & Steam-thread-owned: only Hook_CheckAppOwnership mutates Valve's
+//    package vector, and only when initialized or notified of a change.
+//  * Capacity-only / controlled grow: we write into spare capacity that exists
+//    at that moment (or validated Valve grow), and defer the rest.
 
 // Raw SEH fence without C++ objects (C2712) around the whole maintenance flow.
 static bool MaintenanceFence(void* pCPackageInfo, void* pCUser);
@@ -412,8 +423,8 @@ static bool MaintenanceFence(void* pCPackageInfo, void* pCUser);
 static void ConsumeLicenseMaintenance() {
     std::lock_guard<std::mutex> lock(g_licenseMutex);
     if (!g_pCPackageInfo || !oGetPackageInfo || !g_pCUser) return;
+    static bool gaveUp = false;
     if (g_maintenanceAttempts.load() >= 8) {
-        static bool gaveUp = false;
         if (!gaveUp) {
             HookManager::Log("LicenseInjection: giving up after repeated maintenance failures");
             gaveUp = true;
@@ -422,14 +433,16 @@ static void ConsumeLicenseMaintenance() {
         }
         return;
     }
+    gaveUp = false;
     g_maintenanceAttempts.fetch_add(1);
 
     if (!MaintenanceFence(g_pCPackageInfo, g_pCUser)) {
         HookManager::Log("LicenseInjection: exception inside license maintenance; steady state entered to protect UI");
-        g_licenseDone = true;
+        g_licenseDone.store(true);
         g_licenseInitialized = true;
         g_licenseChangeRequested.store(false);
-    } else if (g_licenseDone) {
+    } else if (g_licenseDone.load()) {
+        g_maintenanceAttempts.store(0);
         g_licenseChangeRequested.store(false);
         g_licenseInitialized = true;
     } else {
@@ -453,7 +466,7 @@ static bool MaintenanceBody(void* pCPackageInfo) {
 
     if (!ValidatePackageInfo(pPkg)) {
         HookManager::Log("LicenseInjection: package object failed sanity validation; injection disabled for this session");
-        g_licenseDone = true;
+        g_licenseDone.store(true);
         return true;
     }
 
@@ -466,15 +479,29 @@ static bool MaintenanceBody(void* pCPackageInfo) {
     static bool injectedOnce = false;
     if (g_licenseForceReset.exchange(false)) {
         injectedOnce = false;
-        g_licenseDone = false;
+        g_licenseDone.store(false);
     }
     if (injectedOnce) {
-        g_licenseDone = true; // steady state — one-shot policy
+        g_licenseDone.store(true); // steady state
         return true;
     }
 
     std::vector<uint32_t> appIds;
     AppManager::Get().GetUnlockedApps(appIds);
+    std::unordered_set<uint32_t> wantedSet(appIds.begin(), appIds.end());
+
+    // Remove only apps that IceBreaker itself previously injected and that are no longer unlocked
+    uint32_t removed = 0;
+    for (auto it = g_injectedPkg0Apps.begin(); it != g_injectedPkg0Apps.end(); ) {
+        if (wantedSet.find(*it) == wantedSet.end()) {
+            if (pPkg->AppIdVec.FindAndFastRemove(*it)) {
+                ++removed;
+            }
+            it = g_injectedPkg0Apps.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     auto& vec = pPkg->AppIdVec;
     const int64_t spareNow = static_cast<int64_t>(vec.m_Memory.m_nAllocationCount) - vec.m_Size;
@@ -487,57 +514,69 @@ static bool MaintenanceBody(void* pCPackageInfo) {
         if (!exists) ++missingTotal;
     }
 
-    if (missingTotal == 0) {
-        HookManager::Log("LicenseInjection: nothing to inject; entering steady state");
-        injectedOnce = true;
-        g_licenseDone = true;
-        return true;
-    }
-
-    uint32_t written = AppendAppIds(pPkg, appIds);
-    if (written < missingTotal && oCUtlMemoryGrow) {
-        const int64_t needGrow = missingTotal - written - (spareNow > 0 ? spareNow : 0);
-        if (needGrow > 0) {
-            const uint32_t oldSize = vec.m_Size;
-            const uint32_t oldAlloc = vec.m_Memory.m_nAllocationCount;
-            if (GrowVectorRaw(&pPkg->AppIdVec, static_cast<int>(needGrow))) {
-                const uint32_t newAlloc = vec.m_Memory.m_nAllocationCount;
-                const uint32_t newSize = vec.m_Size;
-                bool okA = (newAlloc >= oldSize + needGrow) && (newSize == oldSize);
-                bool okB = (newSize == oldSize + needGrow) && (newAlloc >= newSize);
-                if (okA || okB) {
-                    HookManager::Log("LicenseInjection: grew vector " +
-                                     std::to_string(oldAlloc) + "->" + std::to_string(newAlloc) +
-                                     (okB ? " (size grew too)" : ""));
-                    written += AppendAppIds(pPkg, appIds);
-                } else {
-                    HookManager::Log("LicenseInjection: grow postcondition unclear (" +
-                                     std::to_string(oldAlloc) + "/" + std::to_string(newAlloc) +
-                                     ", size " + std::to_string(oldSize) + "->" +
-                                     std::to_string(newSize) + "); keeping capacity-only result");
-                    // roll back any size change Valve's grow made so our append
-                    // accounting stays consistent with what we wrote.
-                    if (newSize != oldSize && newAlloc >= oldSize) {
-                        vec.m_Size = oldSize;
+    std::vector<uint32_t> newlyAdded;
+    uint32_t written = 0;
+    if (missingTotal > 0) {
+        written = AppendAppIds(pPkg, appIds, &newlyAdded);
+        if (written < missingTotal && oCUtlMemoryGrow) {
+            const int64_t needGrow = missingTotal - written - (spareNow > 0 ? spareNow : 0);
+            if (needGrow > 0) {
+                const uint32_t oldSize = vec.m_Size;
+                const uint32_t oldAlloc = vec.m_Memory.m_nAllocationCount;
+                if (GrowVectorRaw(&pPkg->AppIdVec, static_cast<int>(needGrow))) {
+                    const uint32_t newAlloc = vec.m_Memory.m_nAllocationCount;
+                    const uint32_t newSize = vec.m_Size;
+                    bool okA = (newAlloc >= oldSize + needGrow) && (newSize == oldSize);
+                    bool okB = (newSize == oldSize + needGrow) && (newAlloc >= newSize);
+                    if (okA || okB) {
+                        HookManager::Log("LicenseInjection: grew vector " +
+                                         std::to_string(oldAlloc) + "->" + std::to_string(newAlloc) +
+                                         (okB ? " (size grew too)" : ""));
+                        written += AppendAppIds(pPkg, appIds, &newlyAdded);
+                    } else {
+                        HookManager::Log("LicenseInjection: grow postcondition unclear (" +
+                                         std::to_string(oldAlloc) + "/" + std::to_string(newAlloc) +
+                                         ", size " + std::to_string(oldSize) + "->" +
+                                         std::to_string(newSize) + "); keeping capacity-only result");
+                        // roll back any size change Valve's grow made so our append
+                        // accounting stays consistent with what we wrote.
+                        if (newSize != oldSize && newAlloc >= oldSize) {
+                            vec.m_Size = oldSize;
+                        }
                     }
+                } else {
+                    HookManager::Log("LicenseInjection: caught exception growing AppId vector");
                 }
-            } else {
-                HookManager::Log("LicenseInjection: caught exception growing AppId vector");
             }
         }
     }
 
+    for (uint32_t id : newlyAdded) {
+        g_injectedPkg0Apps.insert(id);
+    }
+
+    if (missingTotal == 0 && removed == 0) {
+        HookManager::Log("LicenseInjection: nothing to inject; entering steady state");
+        injectedOnce = true;
+        g_licenseDone.store(true);
+        return true;
+    }
+
+    if (removed > 0) {
+        HookManager::Log("LicenseInjection: removed " + std::to_string(removed) +
+                         " locked/deleted ids from package " + std::to_string(kInjectedPackageId));
+    }
     if (written < missingTotal) {
         HookManager::Log("LicenseInjection: deferred " + std::to_string(missingTotal - written) +
                          " ids (capacity only)");
-    } else {
+    } else if (written > 0) {
         HookManager::Log("LicenseInjection: appended all " + std::to_string(written) +
                          " requested ids to package " + std::to_string(kInjectedPackageId));
     }
     injectedOnce = (written >= missingTotal); // retry allowed while capacity blocks us
-    g_licenseDone = injectedOnce;
+    g_licenseDone.store(injectedOnce);
 
-    if (written > 0) {
+    if (written > 0 || removed > 0) {
         // Mark the license changed so Steam's own background machinery notices.
         // ProcessPendingLicenseUpdates is experimental (ICEBREAKER_FULL=1): the
         // synchronous wait on unresolved appinfo throws when skip-flagging is
@@ -572,17 +611,14 @@ static bool MaintenanceFence(void* pCPackageInfo, void* /*pCUser*/) {
 }
 
 void PatchEngine::NotifyLicenseChanged(bool forceRescan) {
-    // Safe from any thread: only raises the request; the actual mutation runs
-    // inside Hook_CheckAppOwnership on Steam's own thread.
+    // Safe from any thread: only raises requests/versions; actual Valve state
+    // mutation runs on Steam's own thread inside Hook_CheckAppOwnership / Hook_GetPackageInfo.
     if (forceRescan) {
-        g_licenseForceReset.store(true);
-        g_licenseDone = false;
-        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
-        g_virtualPackages.clear();
-        g_virtualPkgAppStorage.clear();
+        g_maintenanceAttempts.store(0);
     }
-    // Re-arm so new apps in the Lua registry get appended to the package
-    g_licenseDone = false;
+    g_licenseStateVersion.fetch_add(1, std::memory_order_acq_rel);
+    g_licenseForceReset.store(true);
+    g_licenseDone.store(false);
     g_licenseChangeRequested.store(true);
 }
 
@@ -673,45 +709,76 @@ static PackageInfo* Hook_GetPackageInfo(void* pThis, uint32_t packageId, uint64_
         HookManager::Log("GetPackageInfo: captured CPackageInfo");
     }
 
-    // Check if this packageId is one of our virtual game packages
+    if (packageId == kInjectedPackageId) {
+        return oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
+    }
+
+    const uint64_t curVer = g_licenseStateVersion.load(std::memory_order_acquire);
+
+    // Fast path: check if this packageId is already up-to-date for the current state version
     {
         std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
         auto it = g_virtualPackages.find(packageId);
-        if (it != g_virtualPackages.end()) {
-            return &it->second;
+        if (it != g_virtualPackages.end() && it->second.version == curVer) {
+            if (it->second.active) {
+                return &it->second.info;
+            }
+            return oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
         }
     }
 
     PackageInfo* result = oGetPackageInfo ? oGetPackageInfo(pThis, packageId, accessToken) : nullptr;
-    if (result) return result;
+    if (result) {
+        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
+        auto vit = g_virtualPackages.find(packageId);
+        if (vit != g_virtualPackages.end()) {
+            vit->second.active = false;
+            vit->second.version = curVer;
+        }
+        return result;
+    }
 
     // If Steam has no record of this packageId, check if it belongs to our unlocked games
     std::unordered_map<uint32_t, std::vector<uint32_t>> packages;
     AppManager::Get().GetPackages(packages);
     auto pkgIt = packages.find(packageId);
-    if (pkgIt != packages.end()) {
-        std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
-        auto& storage = g_virtualPkgAppStorage[packageId];
-        storage = pkgIt->second;
 
-        auto& pkg = g_virtualPackages[packageId];
-        pkg.PackageId = packageId;
-        pkg.ChangeNumber = 1;
-        pkg.BillingType = 12; // FreeOnDemand / BillPrepurchase
-        pkg.LicenseType = 1;  // SinglePurchase
-        pkg.Status = 0;       // Available
-        memset(pkg.SHA_1_Hash, 0, sizeof(pkg.SHA_1_Hash));
-        pkg.pPackageInfoNodeBegin = nullptr;
-        pkg.pExtendNodeBegin = nullptr;
-        pkg.AppIdVec.m_Memory.m_pMemory = storage.data();
-        pkg.AppIdVec.m_Memory.m_nAllocationCount = static_cast<int>(storage.size());
-        pkg.AppIdVec.m_Size = static_cast<int>(storage.size());
+    std::lock_guard<std::mutex> lock(g_virtualPkgMutex);
+    if (pkgIt != packages.end() && !pkgIt->second.empty()) {
+        auto& entry = g_virtualPackages[packageId];
+        entry.version = curVer;
+        std::vector<uint32_t> sortedApps = pkgIt->second;
+        std::sort(sortedApps.begin(), sortedApps.end());
 
-        HookManager::Log("GetPackageInfo: synthesized virtual package " + std::to_string(packageId) +
-                         " with " + std::to_string(storage.size()) + " appids");
-        return &pkg;
+        if (entry.storage != sortedApps) {
+            if (!entry.storage.empty()) {
+                // Keep previously returned vector buffers alive so cached PackageInfo pointers never dangle
+                g_retiredPkgStorage.push_back(std::move(entry.storage));
+            }
+            entry.storage = std::move(sortedApps);
+            entry.info.PackageId = packageId;
+            entry.info.ChangeNumber = 1;
+            entry.info.BillingType = 12; // FreeOnDemand / BillPrepurchase
+            entry.info.LicenseType = 1;  // SinglePurchase
+            entry.info.Status = 0;       // Available
+            memset(entry.info.SHA_1_Hash, 0, sizeof(entry.info.SHA_1_Hash));
+            entry.info.pPackageInfoNodeBegin = nullptr;
+            entry.info.pExtendNodeBegin = nullptr;
+            entry.info.AppIdVec.m_Memory.m_pMemory = entry.storage.data();
+            entry.info.AppIdVec.m_Memory.m_nAllocationCount = static_cast<uint32_t>(entry.storage.size());
+            entry.info.AppIdVec.m_Size = static_cast<uint32_t>(entry.storage.size());
+            HookManager::Log("GetPackageInfo: synthesized virtual package " + std::to_string(packageId) +
+                             " with " + std::to_string(entry.storage.size()) + " appids");
+        }
+        entry.active = true;
+        return &entry.info;
     }
 
+    auto vit = g_virtualPackages.find(packageId);
+    if (vit != g_virtualPackages.end()) {
+        vit->second.active = false;
+        vit->second.version = curVer;
+    }
     return nullptr;
 }
 
@@ -1026,27 +1093,65 @@ static pfnShouldShowAppInLibrary oShouldShowAppInLibrary = nullptr;
 typedef BOOL(WINAPI* pfnDeleteFileW)(LPCWSTR lpFileName);
 static pfnDeleteFileW oDeleteFileW = nullptr;
 
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &out[0], needed, nullptr, nullptr);
+    return out;
+}
+
+static bool EndsWithManifestCI(const wchar_t* s, size_t len) {
+    static constexpr wchar_t kExt[] = L".manifest";
+    constexpr size_t kExtLen = 9;
+    if (len <= kExtLen) return false;
+    const wchar_t* tail = s + (len - kExtLen);
+    for (size_t i = 0; i < kExtLen; ++i) {
+        wchar_t c = tail[i];
+        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c + (L'a' - L'A'));
+        if (c != kExt[i]) return false;
+    }
+    return true;
+}
+
 static BOOL WINAPI Hook_DeleteFileW(LPCWSTR lpFileName) {
     if (lpFileName) {
-        std::wstring path(lpFileName);
-        std::wstring lower = path;
-        for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+        size_t len = wcslen(lpFileName);
+        if (EndsWithManifestCI(lpFileName, len)) {
+            std::wstring lower(lpFileName, len);
+            for (auto& ch : lower) {
+                if (ch == L'/') ch = L'\\';
+                else ch = static_cast<wchar_t>(towlower(ch));
+            }
 
-        // Protect .manifest files inside Steam's depotcache belonging to unlocked Lua depots
-        if (lower.find(L"\\depotcache\\") != std::wstring::npos &&
-            lower.size() > 9 && lower.compare(lower.size() - 9, 9, L".manifest") == 0) {
-            size_t slash = lower.find_last_of(L"\\/");
-            std::wstring fname = (slash != std::wstring::npos) ? lower.substr(slash + 1) : lower;
-            size_t underscore = fname.find(L'_');
-            if (underscore != std::wstring::npos && underscore > 0) {
-                try {
-                    uint32_t depotId = std::stoul(fname.substr(0, underscore));
-                    if (AppManager::Get().IsAppUnlocked(depotId)) {
-                        HookManager::Log("DepotCacheProtect: blocked DeleteFileW on unlocked manifest " +
-                                         std::string(fname.begin(), fname.end()));
-                        return TRUE;
+            // Protect .manifest files inside Steam's depotcache belonging to unlocked Lua depots
+            if (lower.find(L"\\depotcache\\") != std::wstring::npos ||
+                lower.rfind(L"depotcache\\", 0) == 0) {
+                size_t slash = lower.find_last_of(L'\\');
+                std::wstring fname = (slash != std::wstring::npos) ? lower.substr(slash + 1) : lower;
+                size_t underscore = fname.find(L'_');
+                if (underscore != std::wstring::npos && underscore > 0 && underscore <= 10) {
+                    uint64_t val = 0;
+                    bool digitsOnly = true;
+                    for (size_t i = 0; i < underscore; ++i) {
+                        wchar_t d = fname[i];
+                        if (d < L'0' || d > L'9') {
+                            digitsOnly = false;
+                            break;
+                        }
+                        val = val * 10 + static_cast<uint64_t>(d - L'0');
                     }
-                } catch (...) {}
+                    if (digitsOnly && val > 0 && val <= 0xFFFFFFFFULL) {
+                        uint32_t depotId = static_cast<uint32_t>(val);
+                        if (AppManager::Get().IsAppUnlocked(depotId)) {
+                            HookManager::Log("DepotCacheProtect: blocked DeleteFileW on unlocked manifest " +
+                                             WideToUtf8(fname));
+                            SetLastError(ERROR_SUCCESS);
+                            return TRUE;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1083,14 +1188,14 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
 
     HMODULE hMod = reinterpret_cast<HMODULE>(base);
 
-    // 0. Fast-path: Check PE Timestamp & Size RVA Cache (0 ms, 0 pattern scanning)
-    if (uintptr_t cachedAddr = RvaCache::GetCachedAddress(hMod, pat.name)) {
+    // 0. Fast-path: Check PE Timestamp & Size local RVA Cache (0 ms, no network, bounds-checked)
+    if (uintptr_t cachedAddr = RvaCache::GetCachedLocalAddress(hMod, pat.name)) {
         PatchEngine::CacheResolved(pat.name, cachedAddr);
         HookManager::Log(std::string(tag) + ": found " + pat.name + " via RVA Cache at " + Hex(cachedAddr));
         return;
     }
 
-    // 1. Try local patterns first
+    // 1. Try local patterns first (offline, deterministic, uniqueness-checked)
     for (const auto& sig : pat.patterns) {
         uintptr_t addr = Scanner::ScanModule(hMod, sig);
         if (addr) {
@@ -1110,12 +1215,21 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
         }
     }
 
-    // 2. Fallback to OTA patterns if available
+    // 2. Fallback to OTA patterns if provided
     auto it = otaPatterns.find(pat.name);
     if (it != otaPatterns.end()) {
         for (const auto& otaSig : it->second) {
             uintptr_t addr = Scanner::ScanModule(hMod, otaSig);
             if (addr) {
+                if (IsHookedName(pat.name)) {
+                    size_t hits = Scanner::CountMatches(hMod, otaSig);
+                    if (hits != 1) {
+                        HookManager::Log(std::string(tag) + ": OTA " + pat.name +
+                                         " matched " + std::to_string(hits) +
+                                         " locations — ambiguous, skipped");
+                        continue;
+                    }
+                }
                 PatchEngine::CacheResolved(pat.name, addr);
                 RvaCache::SaveAddress(hMod, pat.name, addr);
                 HookManager::Log(std::string(tag) + ": found " + pat.name + " via OTA at " + Hex(addr));
@@ -1124,7 +1238,14 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
         }
     }
 
-    // 3. Fallback to in-engine heuristic discovery (string / constant xref & prologue back-scan)
+    // 3. Fallback to Cloudflare KV remote RVA cache only when local patterns missed
+    if (uintptr_t remoteAddr = RvaCache::FetchRemoteAddress(hMod, pat.name)) {
+        PatchEngine::CacheResolved(pat.name, remoteAddr);
+        HookManager::Log(std::string(tag) + ": found " + pat.name + " via Remote RVA Cache at " + Hex(remoteAddr));
+        return;
+    }
+
+    // 4. Fallback to in-engine heuristic discovery (string / constant xref & prologue back-scan)
     uintptr_t heuristicAddr = 0;
     if (strcmp(pat.name, "ConfigStoreGetBinary") == 0) {
         if (uintptr_t xref = HeuristicResolver::FindXref(hMod, "ConfigStore")) {
@@ -1153,13 +1274,22 @@ static void Resolve(const PatternDefinition& pat, uintptr_t base, const char* ta
         }
     }
 
-    if (heuristicAddr) {
+    if (heuristicAddr && heuristicAddr > base &&
+        RvaCache::IsValidCodeRva(hMod, heuristicAddr - base)) {
+        std::string synthPat = HeuristicResolver::SynthesizePattern(heuristicAddr);
+        if (IsHookedName(pat.name) && !synthPat.empty()) {
+            size_t hits = Scanner::CountMatches(hMod, synthPat);
+            if (hits != 1) {
+                HookManager::Log(std::string(tag) + ": heuristic " + pat.name +
+                                 " synthesized pattern matched " + std::to_string(hits) +
+                                 " locations — ambiguous, skipped");
+                return;
+            }
+        }
         PatchEngine::CacheResolved(pat.name, heuristicAddr);
         RvaCache::SaveAddress(hMod, pat.name, heuristicAddr);
         HookManager::Log(std::string(tag) + ": recovered " + pat.name + " via Heuristic at " + Hex(heuristicAddr));
 
-        // Auto-synthesize pattern and store in local cache so future boots load instantly
-        std::string synthPat = HeuristicResolver::SynthesizePattern(heuristicAddr);
         if (!synthPat.empty()) {
             OtaClient::CacheSynthesizedPattern(pat.name, synthPat);
         }
@@ -1181,11 +1311,8 @@ void PatchEngine::ApplyInMemoryPatches() {
 
         HookManager::Log("Scanning in-memory patterns (steamui=" + Hex(ui) + " steamclient64=" + Hex(client) + ")");
 
-        // Query OTA pattern feed asynchronously or on startup with local cache fallback
-        auto otaPatterns = OtaClient::FetchPatterns();
-        if (!otaPatterns.empty()) {
-            HookManager::Log("OTA: Loaded " + std::to_string(otaPatterns.size()) + " pattern definitions from OTA/cache.");
-        }
+        // Skip synchronous OTA network fetch on startup — RvaCache & local signatures resolve instantly.
+        std::unordered_map<std::string, std::vector<std::string>> otaPatterns;
 
         if (ui) {
             for (const auto& pat : g_SteamUIPatterns) {
@@ -1203,8 +1330,11 @@ void PatchEngine::ApplyInMemoryPatches() {
             }
         }
 
-        if (HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
-            if (void* pDel = reinterpret_cast<void*>(GetProcAddress(kernel32, "DeleteFileW"))) {
+        // Hook kernelbase!DeleteFileW when available (covers kernel32 forwarding, API-sets/ucrtbase, and DeleteFileA)
+        HMODULE hDelMod = GetModuleHandleW(L"kernelbase.dll");
+        if (!hDelMod) hDelMod = GetModuleHandleW(L"kernel32.dll");
+        if (hDelMod) {
+            if (void* pDel = reinterpret_cast<void*>(GetProcAddress(hDelMod, "DeleteFileW"))) {
                 HookManager::CreateHook(pDel,
                                         reinterpret_cast<void*>(&Hook_DeleteFileW),
                                         reinterpret_cast<void**>(&oDeleteFileW),

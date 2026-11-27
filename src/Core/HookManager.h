@@ -9,7 +9,7 @@ namespace IceBreaker {
 class HookManager {
 public:
     static bool Initialize();
-    static void Shutdown();
+    static void Shutdown(bool skipLog = false);
 
     static bool CreateHook(void* target, void* detour, void** original, const std::string& name = "");
     static bool EnableHook(void* target);
