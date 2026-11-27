@@ -1,3 +1,4 @@
-* Re-enabled GetOrAddAppData skip-flag hook to prevent pending license update hangs
-* Resolved Steam Error 56 and unblocked client startup when injected apps lack PICS metadata
-* Ensured library visibility and active entitlement processing for all injected apps
+- Diff-based app sync (delta-only updates instead of full clear-and-reload)
+- Steam refresh callbacks triggered only when state actually changes
+- 500ms in-DLL debounce on rapid RELOAD calls with disk-truth reconciliation
+- Improved unlock license refresh & complete app state purge

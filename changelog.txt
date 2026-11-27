@@ -1,3 +1,4 @@
-[+] Re-enabled CAppInfoCache::GetOrAddAppData skip-flag hook to resolve pending license hangs and unblock library updates
-[+] Prevented Steam Error 56 and blocked startup when injected apps lack upstream PICS metadata
-[+] Maintained Released state on owned and unlocked packages to ensure library visibility
+[+] Implemented diff-based app sync (only adds/removes delta AppIDs instead of full clear-and-reload)
+[+] Optimized Steam refresh callbacks to notify only when AppIDs actually change
+[+] Added 500ms in-DLL debounce on rapid RELOAD requests with full disk reconciliation
+[+] Fixed unlock license refresh, complete app state purge, and reload debouncing
