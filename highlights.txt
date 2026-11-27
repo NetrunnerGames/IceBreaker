@@ -1,2 +1,2 @@
-- Fixed owned Steam games disappearing from library when IceBreaker is active
-- Delegated non-Lua AppIDs directly to Steam's native library visibility check
+- Added depotcache protection hook to prevent Steam from purging unlocked cache files
+- Improved compatibility with locally cached game files

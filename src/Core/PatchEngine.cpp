@@ -1023,6 +1023,36 @@ static bool Hook_BBuildAndAsyncSendFrame(void* pObject, uint32_t opCode, uint8_t
 typedef bool (*pfnShouldShowAppInLibrary)(void* pThis, uint32_t appId);
 static pfnShouldShowAppInLibrary oShouldShowAppInLibrary = nullptr;
 
+typedef BOOL(WINAPI* pfnDeleteFileW)(LPCWSTR lpFileName);
+static pfnDeleteFileW oDeleteFileW = nullptr;
+
+static BOOL WINAPI Hook_DeleteFileW(LPCWSTR lpFileName) {
+    if (lpFileName) {
+        std::wstring path(lpFileName);
+        std::wstring lower = path;
+        for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+
+        // Protect .manifest files inside Steam's depotcache belonging to unlocked Lua depots
+        if (lower.find(L"\\depotcache\\") != std::wstring::npos &&
+            lower.size() > 9 && lower.compare(lower.size() - 9, 9, L".manifest") == 0) {
+            size_t slash = lower.find_last_of(L"\\/");
+            std::wstring fname = (slash != std::wstring::npos) ? lower.substr(slash + 1) : lower;
+            size_t underscore = fname.find(L'_');
+            if (underscore != std::wstring::npos && underscore > 0) {
+                try {
+                    uint32_t depotId = std::stoul(fname.substr(0, underscore));
+                    if (AppManager::Get().IsAppUnlocked(depotId)) {
+                        HookManager::Log("DepotCacheProtect: blocked DeleteFileW on unlocked manifest " +
+                                         std::string(fname.begin(), fname.end()));
+                        return TRUE;
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+    return oDeleteFileW ? oDeleteFileW(lpFileName) : FALSE;
+}
+
 static bool Hook_ShouldShowAppInLibrary(void* pThis, uint32_t appId) {
     if (AppManager::Get().IsAppUnlocked(appId)) {
         return true;
@@ -1170,6 +1200,15 @@ void PatchEngine::ApplyInMemoryPatches() {
                                         reinterpret_cast<void*>(&Hook_ShouldShowAppInLibrary),
                                         reinterpret_cast<void**>(&oShouldShowAppInLibrary),
                                         "ShouldShowAppInLibrary");
+            }
+        }
+
+        if (HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
+            if (void* pDel = reinterpret_cast<void*>(GetProcAddress(kernel32, "DeleteFileW"))) {
+                HookManager::CreateHook(pDel,
+                                        reinterpret_cast<void*>(&Hook_DeleteFileW),
+                                        reinterpret_cast<void**>(&oDeleteFileW),
+                                        "DeleteFileW");
             }
         }
 

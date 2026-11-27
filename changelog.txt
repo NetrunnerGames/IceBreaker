@@ -1,2 +1,2 @@
-[+] Fixed Hook_ShouldShowAppInLibrary hiding genuinely owned Steam games when m_ownedApps was empty
-[+] Delegated non-Lua AppIDs directly to Steam's native ShouldShowAppInLibrary check
+[+] Added DeleteFileW protection hook to prevent Steam from purging unlocked depotcache files
+[+] Improved compatibility with locally cached game files
