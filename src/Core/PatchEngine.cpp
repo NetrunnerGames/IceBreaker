@@ -1027,12 +1027,8 @@ static bool Hook_ShouldShowAppInLibrary(void* pThis, uint32_t appId) {
     if (AppManager::Get().IsAppUnlocked(appId)) {
         return true;
     }
-    // If not unlocked in AppManager and not marked as genuinely owned from Valve,
-    // do not show it in the library view (prevent stale memory leaks from keeping removed titles).
-    if (AppManager::Get().IsMarkedOwned(appId) && oShouldShowAppInLibrary) {
-        return oShouldShowAppInLibrary(pThis, appId);
-    }
-    return false;
+    // Delegate all non-Lua apps to Steam's native ownership check so owned games are never hidden.
+    return oShouldShowAppInLibrary ? oShouldShowAppInLibrary(pThis, appId) : false;
 }
 
 // Names whose address gets DETOURed. For these the match must be unique across

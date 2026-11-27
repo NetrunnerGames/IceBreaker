@@ -1,4 +1,2 @@
-- Diff-based app sync (delta-only updates instead of full clear-and-reload)
-- Steam refresh callbacks triggered only when state actually changes
-- 500ms in-DLL debounce on rapid RELOAD calls with disk-truth reconciliation
-- Improved unlock license refresh & complete app state purge
+- Fixed owned Steam games disappearing from library when IceBreaker is active
+- Delegated non-Lua AppIDs directly to Steam's native library visibility check

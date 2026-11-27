@@ -1,4 +1,2 @@
-[+] Implemented diff-based app sync (only adds/removes delta AppIDs instead of full clear-and-reload)
-[+] Optimized Steam refresh callbacks to notify only when AppIDs actually change
-[+] Added 500ms in-DLL debounce on rapid RELOAD requests with full disk reconciliation
-[+] Fixed unlock license refresh, complete app state purge, and reload debouncing
+[+] Fixed Hook_ShouldShowAppInLibrary hiding genuinely owned Steam games when m_ownedApps was empty
+[+] Delegated non-Lua AppIDs directly to Steam's native ShouldShowAppInLibrary check
