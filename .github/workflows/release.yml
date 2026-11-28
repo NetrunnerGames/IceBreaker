@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without v prefix (e.g. 2.20)'
+        required: false
+        default: ''
+      title:
+        description: 'Optional release title'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release IceBreaker
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Version
+        id: version
+        shell: pwsh
+        run: |
+          $ver = ""
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -match '^v(.+)$') {
+            $ver = $Matches[1]
+          } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.version }}")) {
+            $ver = "${{ inputs.version }}".TrimStart('v')
+          } else {
+            $latestTag = git describe --tags --abbrev=0 2>$null
+            if ($latestTag -match '^v(.+)$') {
+              $ver = $Matches[1]
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            throw "Failed to resolve release version."
+          }
+          Write-Host "Resolved version: $ver"
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Configure & Build (Release)
+        shell: pwsh
+        run: |
+          cmake -B build
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "build/Release/version.dll")) {
+            throw "CMake Release build failed or version.dll missing."
+          }
+
+      - name: Package ZIP for Discord Announcement
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName "System.IO.Compression.FileSystem"
+          $zipTemp = Join-Path $env:RUNNER_TEMP "icebreaker_zip"
+          New-Item -ItemType Directory -Path $zipTemp -Force | Out-Null
+          Copy-Item "build/Release/version.dll" "$zipTemp/version.dll" -Force
+          $zipPath = "build/Release/IceBreaker-${{ steps.version.outputs.tag }}.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($zipTemp, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $customTitle = "${{ inputs.title }}"
+          $releaseTitle = if ([string]::IsNullOrWhiteSpace($customTitle)) { "Release $tag" } else { "Release ${tag}: $customTitle" }
+          $hasChangelog = (Test-Path "changelog.txt") -and -not [string]::IsNullOrWhiteSpace((Get-Content -Raw -Encoding utf8 "changelog.txt"))
+          $notesArgs = if ($hasChangelog) { @("--notes-file", "changelog.txt") } else { @("--generate-notes") }
+
+          & gh release create $tag "build/Release/version.dll" --title "$releaseTitle" --target "${{ github.sha }}" @notesArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Dispatch Discord Announcement
+        env:
+          BOT_SECRET: ${{ secrets.BOT_SECRET }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName "System.Net.Http"
+
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $customTitle = "${{ inputs.title }}"
+          $announceTitle = if ([string]::IsNullOrWhiteSpace($customTitle)) { "IceBreaker $tag Released!" } else { "IceBreaker $tag — $customTitle" }
+
+          $changelogText = if (Test-Path "changelog.txt") { Get-Content -Raw -Encoding utf8 "changelog.txt" } else { "" }
+          $highlightsText = if (Test-Path "highlights.txt") { Get-Content -Raw -Encoding utf8 "highlights.txt" } else { "" }
+
+          function Add-FormField ($multiContent, $name, $value) {
+            if ([string]::IsNullOrWhiteSpace($value)) { return }
+            $sc = [System.Net.Http.StringContent]::new($value)
+            $sc.Headers.ContentDisposition = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new("form-data")
+            $sc.Headers.ContentDisposition.Name = '"' + $name + '"'
+            $multiContent.Add($sc)
+          }
+
+          $client = [System.Net.Http.HttpClient]::new()
+          $client.Timeout = [TimeSpan]::FromMinutes(2)
+          if (-not [string]::IsNullOrWhiteSpace($env:BOT_SECRET)) {
+            $client.DefaultRequestHeaders.Add("X-Bot-Secret", $env:BOT_SECRET)
+          }
+
+          $content = [System.Net.Http.MultipartFormDataContent]::new("----IceBreakerBoundary$([Guid]::NewGuid().ToString('N'))")
+          Add-FormField $content "version" $version
+          Add-FormField $content "repo_name" "IceBreaker"
+          Add-FormField $content "repo_url" "https://github.com/NetrunnerGames/IceBreaker"
+          Add-FormField $content "title" $announceTitle
+          Add-FormField $content "release_url" "https://github.com/NetrunnerGames/IceBreaker/releases/tag/$tag"
+          Add-FormField $content "changelog" $changelogText
+          Add-FormField $content "highlights" $highlightsText
+
+          $zipName = "IceBreaker-$tag.zip"
+          $zipPath = (Resolve-Path "build/Release/$zipName").Path
+          $fileBytes = [System.IO.File]::ReadAllBytes($zipPath)
+          $bc = [System.Net.Http.ByteArrayContent]::new($fileBytes)
+          $bc.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/zip")
+          $bc.Headers.ContentDisposition = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new("form-data")
+          $bc.Headers.ContentDisposition.Name = '"file"'
+          $bc.Headers.ContentDisposition.FileName = '"' + $zipName + '"'
+          $content.Add($bc)
+
+          $response = $client.PostAsync("https://bots.netrunnergames.workers.dev/api/announce", $content).GetAwaiter().GetResult()
+          $resText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+          if (-not $response.IsSuccessStatusCode) {
+            throw "Discord announce worker returned HTTP $([int]$response.StatusCode) ($($response.StatusCode)): $resText"
+          }
+          Write-Host "Worker Response (HTTP $([int]$response.StatusCode)): $resText"
